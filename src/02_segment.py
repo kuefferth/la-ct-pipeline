@@ -19,7 +19,7 @@ LA_DIR    = Path("derivatives/seg_la")
 # heartchambers_highres label order: 1=myocardium, 2=atrium_left, 3=ventricle_left,
 # 4=atrium_right, 5=ventricle_right, 6=aorta, 7=pulmonary_artery
 LA_LABEL  = 2
-GLOB      = "4733.nii.gz"   # change to "*.nii.gz" for all cases later
+GLOB      = "*.nii.gz"   # change to "*.nii.gz" for all cases later
 
 def run():
     LA_DIR.mkdir(parents=True, exist_ok=True)
@@ -31,10 +31,10 @@ def run():
             print(f"[{case}] segmenting (heartchambers_highres, force_split)...")
             # force_split = z-chunks, fits 6GB VRAM on GTX 1060
             totalsegmentator(
-            input=str(nii), output=str(seg_out),
-                task="heartchambers_highres", ml=True,
-                device="cpu",
-            )
+                            input=str(nii), output=str(seg_out),
+                            task="heartchambers_highres", ml=True,
+                            device="cpu",
+                        )
         # Extract LA
         seg = sitk.ReadImage(str(seg_out))
         arr = sitk.GetArrayFromImage(seg)
@@ -43,7 +43,7 @@ def run():
             print(f"[{case}] WARNING: no voxels for LA label {LA_LABEL}")
         la_img = sitk.GetImageFromArray(la)
         la_img.CopyInformation(seg)
-        sitk.WriteImage(la_img, str(LA_DIR / f"{case}_LA.nii.gz"))
+        sitk.WriteImage(la_img, str(LA_DIR / f"{case}_LA_seed.nii.gz"))
         print(f"[{case}] LA mask written ({la.sum()} voxels)")
 
 if __name__ == "__main__":
