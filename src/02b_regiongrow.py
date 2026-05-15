@@ -1,14 +1,18 @@
-"""LA refinement v4: TotalSeg LA seed -> region grow -> LV block -> distance-from-centroid cap.
+"""LA refinement v5: TotalSeg LA seed -> region grow -> LV+aorta block ->
+distance-from-centroid cap -> thin-vessel removal -> closing.
 
 Pipeline:
   1. Erode TotalSeg LA mask by ERODE_MM -> seed
   2. Adaptive threshold from CT intensities inside seed (percentile-based)
   3. Region grow from seed under that threshold window
-  4. Subtract LV mask (raw, no dilation -> preserves mitral plane)
+  4. Subtract LV (raw) + Aorta (dilated 1.5mm) -> preserves mitral plane,
+     prevents aortic root leaks
   5. Keep largest connected component
   6. Cap to voxels within MAX_DIST_FROM_CENTROID_MM of LA seed centroid
-     (cuts distal PV branches; radius-based prune doesn't work because LA body
-     can be as thin as PV trunks)
+     (cuts distal PV branches)
+  6b. Remove thin PV remnants via morphological opening + geodesic reconstruction
+      (erases tubes thinner than ~2*THIN_OPEN_MM diameter, preserves LA body)
+  7. Closing to fill small dents/holes
 """
 
 import os
@@ -26,23 +30,24 @@ SEG_DIR   = Path("derivatives/seg_full")
 LA_DIR    = Path("derivatives/seg_la")
 
 # === Label indices in heartchambers_highres ===
-LA_LABEL = 2   # heart_atrium_left
-LV_LABEL = 3   # heart_ventricle_left
+LA_LABEL    = 2   # heart_atrium_left
+LV_LABEL    = 3   # heart_ventricle_left
+AORTA_LABEL = 6   # aorta
 
 # === Tunables ===
 ERODE_MM                  = 5.0   # seed erosion before sampling intensities + growing
 LV_DILATE_MM              = 0.0   # raw LV (dilation cuts mitral plane)
-MAX_DIST_FROM_CENTROID_MM = 60.0  # cap on distance from LA seed centroid; tune to taste
-GLOB                      = "4733.nii.gz"
+AORTA_DILATE_MM           = 0.0   # pad undersegmented aorta
+MAX_DIST_FROM_CENTROID_MM = 55.0  # cap on distance from LA seed centroid (cuts distal PVs)
+THIN_OPEN_MM              = 2.5     # opening kernel; erases tubes thinner than ~5 mm diameter
+CLOSE_MM                  = 1.0   # closing kernel; fills small dents/holes
+GLOB                      = "*.nii.gz"
 
-# === Tiny timing helper ===
+# === Timing helper ===
 class T:
-    def __init__(self, label):
-        self.label = label
-    def __enter__(self):
-        self.t0 = time.perf_counter(); return self
-    def __exit__(self, *args):
-        print(f"    [time] {self.label}: {time.perf_counter() - self.t0:.2f}s")
+    def __init__(self, label): self.label = label
+    def __enter__(self): self.t0 = time.perf_counter(); return self
+    def __exit__(self, *a): print(f"    [time] {self.label}: {time.perf_counter() - self.t0:.2f}s")
 
 # === Morphology helpers ===
 def erode_mm(mask, mm):
@@ -55,10 +60,21 @@ def dilate_mm(mask, mm):
     spacing = mask.GetSpacing()
     return sitk.BinaryDilate(mask, [max(1, int(round(mm / s))) for s in spacing])
 
+def close_mm(mask, mm):
+    """Binary closing (dilate then erode) by ~mm. Fills small dents/holes."""
+    spacing = mask.GetSpacing()
+    r = [max(1, int(round(mm / s))) for s in spacing]
+    return sitk.BinaryErode(sitk.BinaryDilate(mask, r), r)
+
+def open_then_reconstruct(mask, mm):
+    spacing = mask.GetSpacing()
+    r = [max(1, int(round(mm / s))) for s in spacing]
+    opened = sitk.BinaryDilate(sitk.BinaryErode(mask, r), r)
+    return sitk.BinaryReconstructionByDilation(opened, mask)
+
 # === Threshold from seed intensities ===
 def adaptive_threshold(ct, seed_mask):
-    """Estimate blood-pool HU window from intensities inside eroded seed.
-    Percentile-based; robust to outliers and very bright contrast."""
+    """Blood-pool HU window from intensities inside eroded seed. Percentile-based."""
     ct_arr   = sitk.GetArrayFromImage(ct).astype(np.float32)
     seed_arr = sitk.GetArrayFromImage(seed_mask).astype(bool)
     vals = ct_arr[seed_arr]
@@ -77,39 +93,35 @@ def largest_component(mask):
 
 # === Distance-from-centroid cap (cuts distal PVs) ===
 def distance_from_centroid_cap(mask, seed, max_dist_mm):
-    """Cap mask to voxels within max_dist_mm of the seed centroid (in mm)."""
-    # Centroid of seed in voxel index space
+    """Cap mask to voxels within max_dist_mm of the seed centroid (mm)."""
     arr = sitk.GetArrayFromImage(seed)
     zs, ys, xs = np.where(arr > 0)
     if len(zs) == 0:
         return mask
-    cx, cy, cz = float(xs.mean()), float(ys.mean()), float(zs.mean())  # SITK uses (x,y,z)
+    cx, cy, cz = float(xs.mean()), float(ys.mean()), float(zs.mean())
     centroid_phys = np.array(
         seed.TransformContinuousIndexToPhysicalPoint((cx, cy, cz))
     )
     print(f"    seed centroid (mm): "
           f"({centroid_phys[0]:.1f}, {centroid_phys[1]:.1f}, {centroid_phys[2]:.1f})")
 
-    # Build per-voxel distance to centroid in physical mm
     size      = mask.GetSize()              # (x,y,z)
-    spacing   = np.array(mask.GetSpacing()) # (x,y,z)
+    spacing   = np.array(mask.GetSpacing())
     origin    = np.array(mask.GetOrigin())
     direction = np.array(mask.GetDirection()).reshape(3, 3)
-    # Voxel index grid in array order (z,y,x)
     iz, iy, ix = np.indices((size[2], size[1], size[0]))
-    # Convert voxel idx -> physical coords: phys = origin + R @ (idx * spacing)
     idx_mm = np.stack(
         [ix * spacing[0], iy * spacing[1], iz * spacing[2]], axis=-1
-    )  # shape (z,y,x,3)
+    )
     phys = origin + idx_mm @ direction.T
-    dist = np.linalg.norm(phys - centroid_phys, axis=-1)  # (z,y,x)
+    dist = np.linalg.norm(phys - centroid_phys, axis=-1)
 
     keep = (dist <= max_dist_mm).astype(np.uint8)
     keep_img = sitk.GetImageFromArray(keep)
     keep_img.CopyInformation(mask)
     return sitk.And(mask, keep_img)
 
-# === Per-case ===
+# === Per-case pipeline ===
 def grow_one(case):
     ct_path  = NIFTI_DIR / f"{case}.nii.gz"
     seg_path = SEG_DIR   / f"{case}_chambers.nii.gz"
@@ -120,7 +132,7 @@ def grow_one(case):
         ct  = sitk.ReadImage(str(ct_path))
         seg = sitk.ReadImage(str(seg_path))
 
-    # 1) Seed
+    # 1) Seed = TotalSeg LA eroded
     with T("build + erode LA seed"):
         la_full = sitk.BinaryThreshold(seg, LA_LABEL, LA_LABEL, 1, 0)
         la_seed = erode_mm(la_full, ERODE_MM)
@@ -132,12 +144,16 @@ def grow_one(case):
     # 2) Threshold
     lo, hi = adaptive_threshold(ct, la_seed)
 
-    # 3) LV mask (raw to preserve mitral plane)
-    with T("LV mask"):
-        lv = sitk.BinaryThreshold(seg, LV_LABEL, LV_LABEL, 1, 0)
+    # 3) Forbidden zone: LV (raw) + aorta (dilated)
+    with T("LV + aorta mask"):
+        lv = sitk.BinaryThreshold(seg, LV_LABEL,    LV_LABEL,    1, 0)
+        ao = sitk.BinaryThreshold(seg, AORTA_LABEL, AORTA_LABEL, 1, 0)
+        ao_block = ao if AORTA_DILATE_MM <= 0 else dilate_mm(ao, AORTA_DILATE_MM)
         lv_block = lv if LV_DILATE_MM <= 0 else dilate_mm(lv, LV_DILATE_MM)
-    print(f"  LV block voxels (dilated {LV_DILATE_MM}mm): "
-          f"{int(sitk.GetArrayFromImage(lv_block).sum())}")
+        forbidden = sitk.Or(lv_block, ao_block)
+    print(f"  forbidden voxels: "
+          f"LV={int(sitk.GetArrayFromImage(lv_block).sum())}  "
+          f"Aorta(+{AORTA_DILATE_MM}mm)={int(sitk.GetArrayFromImage(ao_block).sum())}")
 
     # 4) Seed list for ConnectedThreshold (subsample for speed; result identical)
     with T("seed list"):
@@ -154,11 +170,11 @@ def grow_one(case):
         grown = sitk.ConnectedThreshold(ct, seedList=seed_list,
                                         lower=float(lo), upper=float(hi),
                                         replaceValue=1)
-    with T("subtract LV"):
-        grown = sitk.And(grown, sitk.Not(lv_block))
+    with T("subtract LV + aorta"):
+        grown = sitk.And(grown, sitk.Not(forbidden))
     with T("largest CC #1"):
         grown = largest_component(grown)
-    print(f"  after LV-block + largest CC: "
+    print(f"  after forbidden-block + largest CC: "
           f"{int(sitk.GetArrayFromImage(grown).sum())} voxels")
 
     # 6) Distance-from-centroid cap (cuts distal PVs)
@@ -167,15 +183,30 @@ def grow_one(case):
                                             MAX_DIST_FROM_CENTROID_MM)
     with T("largest CC #2"):
         pruned = largest_component(pruned)
+    print(f"  after distance cap (<{MAX_DIST_FROM_CENTROID_MM}mm from centroid): "
+          f"{int(sitk.GetArrayFromImage(pruned).sum())} voxels")
 
-    # 7) Save
+    # 6b) Remove thin PV remnants
+    with T(f"thin-vessel removal (open {THIN_OPEN_MM}mm)"):
+        pruned = open_then_reconstruct(pruned, THIN_OPEN_MM)
+    with T("largest CC after opening"):
+        pruned = largest_component(pruned)
+    print(f"  after thin-vessel removal: "
+          f"{int(sitk.GetArrayFromImage(pruned).sum())} voxels")
+
+    # 7) Closing to fill small dents/holes
+    with T("closing"):
+        pruned = close_mm(pruned, CLOSE_MM)
+    with T("largest CC #3"):
+        pruned = largest_component(pruned)
+
+    # 8) Save
     with T("write output"):
         LA_DIR.mkdir(parents=True, exist_ok=True)
         n_final = int(sitk.GetArrayFromImage(pruned).sum())
         vol_ml  = n_final * np.prod(pruned.GetSpacing()) / 1000.0
         sitk.WriteImage(pruned, str(LA_DIR / f"{case}_LA.nii.gz"))
-    print(f"  after distance cap (<{MAX_DIST_FROM_CENTROID_MM}mm from centroid): "
-          f"{n_final} voxels = {vol_ml:.1f} mL")
+    print(f"  final: {n_final} voxels = {vol_ml:.1f} mL")
     print(f"[{case}] saved")
 
 # === Entry point ===
@@ -183,6 +214,6 @@ if __name__ == "__main__":
     t_total = time.perf_counter()
     for nii in sorted(NIFTI_DIR.glob(GLOB)):
         case = nii.name.replace(".nii.gz", "")
-        print(f"\n[{case}] region-growing v4...")
+        print(f"\n[{case}] region-growing v5...")
         grow_one(case)
     print(f"\n[total] {time.perf_counter() - t_total:.1f}s")
