@@ -56,3 +56,6 @@ def main():
         print(f"\n[run_all] total: {time.perf_counter() - t_total:.1f}s")
     finally:
         keep_awake(False)       # always restore, even on error/exit
+
+if __name__ == "__main__":
+    main()
