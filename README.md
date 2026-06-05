@@ -1,94 +1,87 @@
-# LA-CT Pipeline
+LA-CT segmentation pipeline (Bern → Oxford)
 
-Automated left-atrium segmentation from cardiac CT for downstream DL training on raw geometry (LA body + LAA + PV cuffs as a single structure).
+INPUT
+- Siemens dual-source cardiac CT, DICOM
+- ECG-gated, ~30 series/study (multiple recons)
+- Auto-selected: Bv40f kernel, 0.4mm slice, cardiac FOV (<250mm),
+  AcqNum 501 = diastolic 70%+ RR
 
-## Context
-- **Thomas Küffer**, Inselspital Bern, collab with Oxford cardiac imaging lab
-- Cohort: AF ablation patients; some w/ EAM + outcomes
-- Comm preference: terse, commented code
+PIPELINE (Python, fully automated)
 
-## Hardware
-- Desktop: Win 10, 16 GB RAM, GTX 1060 6 GB (driver 581.57)
-- GPU broken for `heartchambers_highres` on this setup (silent CUDA crash, fully debugged → CPU only); other tasks GPU-fine
-- 16 GB office laptop (no GPU) as backup
+1. DICOM → NIfTI  (01_dicom_to_nifti.py)
+   - SimpleITK series reader
+   - Smart series selection by DICOM tags (kernel, thickness, FOV, acq#)
 
-## Stack
-- Python 3.11, Miniconda env `la`
-- `totalsegmentator`, `SimpleITK`, `pydicom`, `nibabel`, `numpy`, `scipy`, `vtk`, `pyvista`, `tqdm`
-- `torch==2.5.1+cu121` + `torchvision==0.20.1+cu121` (matched pair, install together)
-- VS Code, Git for Windows, Command Prompt terminal w/ `conda init cmd.exe`
-- GitHub: `kuefferth/la-ct-pipeline` (private)
-- 3D Slicer / ParaView for QC
+2. Coarse LA segmentation  (02_segment.py)
+   - TotalSegmentator heartchambers_highres (nnU-Net v2, CPU)
+   - Output: multi-label volume (myo, LA, LV, RA, RV, aorta, PA)
+   - LA label = 2; used as seed only (PVs cut, LAA undershot, walls
+     undershot — boundaries not reliable on their own)
 
-## Data
-- 5 sample cases under `data/<case_id>/` (gitignored): 4733, 4734, 4735, 4736, 4738
-- Siemens dual-source, ~30 series per study, anonymized (empty SeriesDescription)
-- Two cardiac acquisitions per case: AcqNum 501 (diastolic 70%+ RR) **chosen**, 601 (systolic 30–60% RR)
+3. Refinement via region growing  (02b_regiongrow.py, v7)
+   - Seed = TotalSeg LA eroded by 5 mm
+   - Adaptive threshold: [p2−50, p98+150] HU of intensities inside seed
+   - SimpleITK ConnectedThreshold from ~1000 sub-sampled seed voxels
+   - Forbidden zone (subtracted to seal region-grow leaks):
+       LV (raw), RA (raw)       — thin shared walls; dilating would cut the
+                                  mitral plane / eat into interatrial septum
+       aorta, RV, PA (+1.5 mm)  — padded to seal the wall the grow jumps;
+                                  RV + PA added in v6 to stop PA/RV leaks
+   - Largest connected component
+   - Geodesic distance cap: drop voxels >60 mm IN-MASK path distance from the
+     LA seed centroid. Follows the PV tubes instead of slicing a sphere, and
+     drops any component not connected to the seed. (Was Euclidean in v5/v6.)
+   - Thin-branch removal: plain morphological opening (4 mm radius, NO
+     reconstruction). Deletes connected tubes thinner than ~8 mm diameter,
+     keeps thick PV trunk + ostia. (v5/v6 used opening + geodesic
+     reconstruction, which regrew every connected tube → near no-op; dropped.)
+   - Closing (1.5 mm): fills small wall dents
 
-## Series selection rules (Siemens cardiac CT)
-- `ConvolutionKernel == "Bv40f"` (vascular soft kernel)
-- `SliceThickness == 0.4` mm
-- `ReconstructionDiameter < 250` mm (cardiac FOV)
-- `AcquisitionNumber == 501`
-- Phase decoded from `ScanOptions` field (`PULSTART_P####PC`)
+4. Meshing  (03_mesh.py)
+   - Pad mask with 4-voxel background border before contouring
+     (closes caps where the mask touches the CT FOV edge → watertight)
+   - Gaussian pre-smooth (variance 0.6 mm²) for sub-voxel detail
+   - Marching cubes (iso=0.5)
+   - Largest connected component
+   - Taubin smoothing (50 iters, pass_band 0.05) — volume-preserving
+   - Consistent outward-pointing normals
+   - Save full-resolution + decimated (30% triangles) as VTK + STL
 
-## Pipeline
-data/<case>/                                            DICOMs (gitignored)
-→ 01_dicom_to_nifti.py                                smart series selection
-derivatives/nifti/<case>.nii.gz
-→ 02_segment.py                                       TotalSegmentator heartchambers_highres on CPU
-derivatives/seg_full/<case>_chambers.nii.gz             multi-label (myo, LA, LV, RA, RV, aorta, PA)
-derivatives/seg_la/<case>_LA_seed.nii.gz                LA-only from TotalSeg (kept as seed reference)
-→ 02b_regiongrow.py                                   refinement (see below)
-derivatives/seg_la/<case>_LA.nii.gz                     binary LA+LAA+PV-cuffs (final)
-→ 03_mesh.py                                          smooth mask → marching cubes → Taubin → decimate
-derivatives/meshes/<case>_LA.{vtk,stl}                  full-res mesh
-derivatives/meshes/<case>_LA_decimated.{vtk,stl}        decimated (30% triangles)
+OUTPUT
+- Binary LA+PV-cuffs mask (NIfTI, voxel-accurate)
+- Triangulated surface mesh (VTK + STL, full + decimated)
+- Single connected structure, no manual annotation
+- TotalSeg seed kept as *_LA_seed.nii.gz for reference
 
-Diagnostics: `00_inspect_series.py`, `00b_inspect_bv40.py`, `00c_inspect_fov.py`.
+RUNTIME (per case)
+- DICOM → NIfTI:     ~10 s
+- TotalSeg (CPU):    ~5 min  (GPU silently crashes on GTX 1060 + Win 10)
+- Region grow:       ~30 s
+- Meshing:           ~10 s
+- Total:             ~6 min / case
 
-## Segmentation strategy
-**TotalSegmentator `heartchambers_highres`** — academic license registered (`totalseg_set_license`).
-Produces LA chamber blob (label 2). Limitations: PVs cut at ostia, LAA undershot, boundaries undershoot wall.
-Used as **seed** for region-grow refinement, not as final output.
+KNOWN LIMITATIONS
+- PV cut is diameter + length based, not anatomical. Production fix =
+  vmtk centerline cut-planes at PV ostia (planned).
+- LAA not preserved by the opening step (thin appendage tips erased).
+  Acceptable per scope: contrast-filled LAAs are trunk-sized and survive;
+  unfilled LAAs are not in the segmentation anyway.
+- Valve replacements / LAA plugs cause local artifacts (ignored for now)
 
-**Region-grow refinement v5** (`02b_regiongrow.py`):
-1. Seed = TotalSeg LA eroded by 5 mm
-2. Adaptive threshold = `[p2−50, p98+150]` HU of intensities inside eroded seed
-3. SimpleITK `ConnectedThreshold` from ~1000 sub-sampled seed voxels
-4. Forbidden zone = LV (raw, label 3) + aorta (raw, label 6); subtracted
-5. Largest connected component
-6. Distance cap: drop voxels >60 mm from LA seed centroid (cuts distal PVs)
-7. Thin-vessel removal: morphological opening + geodesic reconstruction (kernel 2.5 mm)
-8. Closing (1.5 mm) to fill small wall dents
+STACK
+- Python 3.11, SimpleITK, TotalSegmentator (nnU-Net v2), pyvista, numpy
+- Code: github.com/kuefferth/la-ct-pipeline
 
-## Meshing (`03_mesh.py`)
-- Gaussian pre-smooth (variance 0.6 mm²) → sub-voxel marching-cubes detail
-- Marching cubes (iso=0.5)
-- Largest CC, Taubin smoothing (50 iters, pass_band 0.05), consistent outward normals
-- Save full-res VTK+STL, decimated 30% VTK+STL
+STATUS
+- Steps 0–3 working; ~40-case batch run completed on prior version
+- v6 (PA/RV leak fix) + v7 (geodesic cap, thick-trunk opening) + mesh
+  border-pad implemented; pending re-validation on the 40-case batch
+- Next: vmtk centerline PV cuts; GPU/cloud for the 2000-case scale
 
-## Known Windows + nnUNet workarounds (in scripts)
-1. Env vars BEFORE imports: `nnUNet_n_proc_DA=0`, `nnUNet_def_n_proc=1`, `TORCH_COMPILE_DISABLE=1`, `nnUNet_compile=f`
-2. `if __name__ == "__main__":` guard (Windows multiprocessing safety)
-3. `device="cpu"` for `heartchambers_highres` — GPU silently crashes on this setup
-4. `torchvision` DLL warning is benign — ignore
-5. `heartchambers_highres` doesn't support `--fast`
-
-## Status
-- ✅ Steps 0–3 all working on 5 sample cases
-- ✅ Visual QC done; meshes look clean (minor PV remnants accepted)
-- ⬜ Discuss mesh format/conventions w/ Oxford
-- ⬜ Scale: 2000-case run will need GPU (cloud / better hardware / HPC)
-
-## Open issues / future work
-- **Scaling:** CPU at ~5 min/case × 2000 ≈ 7 days. Cloud GPU (Colab Pro / RunPod T4 ~ $15 total) or RTX A4000-class card recommended.
-- **PV pruning:** distance-from-centroid is crude; for production, fit cut-planes at PV ostia
-- **Valve replacements / LAA plugs:** currently produce small artifacts; ignored for now
-- **Aorta under-segmentation:** if region grows into aortic root, may need to add `pulmonary_artery` (label 7) to forbidden mask too
-- **Per-case parameter tuning:** all tunables at top of each script; values were set on normal anatomy
-
-## Coordination notes for assistants resuming this project
-- User is biomed engineer: strong clinical/imaging knowledge, comfortable with concepts; learning Python ecosystem, GitHub, conda
-- Terse responses, commented code, full files for big changes, line-edits for small ones
-- Commit working state after every meaningful change
+OPEN QUESTIONS FOR OXFORD
+- Mesh format preference: VTK, STL, or both?
+- Target vertex count for DL training (drives decimation level)?
+- Coordinate system / orientation conventions (LPS vs RAS, etc.)?
+- Quality metrics they want logged per case?
+- For scaling to ~2000 cases: do they have GPU/HPC we could leverage,
+  or should we use cloud (Colab Pro / RunPod ~ $0.30-0.50/hr T4)?

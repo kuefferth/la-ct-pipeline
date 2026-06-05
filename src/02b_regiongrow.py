@@ -1,8 +1,16 @@
-"""LA refinement v6: TotalSeg LA seed -> region grow -> forbidden-neighbour block ->
-distance-from-centroid cap -> thin-vessel removal -> closing.
+"""LA refinement v7: TotalSeg LA seed -> region grow -> forbidden-neighbour block ->
+geodesic distance cap -> thick-trunk-only opening -> closing.
 
-v6 change: forbidden zone now includes RA + RV + PA (was LV + aorta only).
-Seals region-grow leaks into the pulmonary artery and right ventricle.
+v7 changes vs v6:
+  - Distance cap is now GEODESIC (in-mask path distance from seed), not Euclidean.
+    Follows the PV tubes instead of slicing a sphere; also drops components not
+    connected to the seed (doubles as a CC filter).
+  - Thin-branch removal is now a PLAIN morphological opening (erode -> dilate),
+    NOT opening-then-reconstruction. Reconstruction regrew every thin tube wired
+    to the body, so it was a near no-op. Plain opening actually deletes connected
+    tubes thinner than ~2*OPEN_RADIUS_MM diameter while keeping the thick trunk.
+    (LAA is not preserved by this; per project scope that is fine, and LAAs that
+    are contrast-filled are trunk-sized so they survive anyway.)
 
 Pipeline:
   1. Erode TotalSeg LA mask by ERODE_MM -> seed
@@ -10,8 +18,8 @@ Pipeline:
   3. Region grow from seed under that threshold window
   4. Subtract forbidden neighbours (LV, RA raw; aorta, RV, PA dilated)
   5. Keep largest connected component
-  6. Cap to voxels within MAX_DIST_FROM_CENTROID_MM of LA seed centroid
-  6b. Remove thin PV remnants via opening + geodesic reconstruction
+  6. Geodesic distance cap from seed centroid (cuts distal PVs along the tube)
+  6b. Plain opening: delete thin branches, keep thick trunk + ostia
   7. Closing to fill small dents/holes
 """
 
@@ -38,9 +46,9 @@ AORTA_LABEL = 6   # aorta
 PA_LABEL    = 7   # pulmonary_artery
 
 # === Forbidden neighbours: label -> dilation (mm) ===
-# Subtracting these seals leaks across thin shared walls. largest-CC then drops
-# whatever the dilated barrier severed.
-#   LV  raw : dilation would cut the mitral plane (we want LA-LV interface intact)
+# Subtracting these seals region-grow leaks across thin shared walls. largest-CC
+# then drops whatever the dilated barrier severed.
+#   LV  raw : dilation would cut the mitral plane (keep LA-LV interface intact)
 #   RA  raw : interatrial septum is thin; dilation would eat into LA
 #   aorta   : TotalSeg under-segments the root, pad a bit
 #   RV / PA : main leak targets; pad to seal the thin wall the grow jumps
@@ -54,11 +62,15 @@ FORBIDDEN = {
 }
 
 # === Tunables ===
-ERODE_MM                  = 5.0   # seed erosion before sampling intensities + growing
-MAX_DIST_FROM_CENTROID_MM = 60.0  # cap on distance from LA seed centroid (cuts distal PVs)
-THIN_OPEN_MM              = 2.5   # opening kernel; erases tubes thinner than ~5mm diameter
-CLOSE_MM                  = 1.5   # closing kernel; fills small dents/holes
-GLOB                      = "*.nii.gz"
+ERODE_MM             = 5.0   # seed erosion before sampling intensities + growing
+MAX_GEODESIC_MM      = 60.0  # in-mask path-distance cap from seed centroid.
+                             # Geodesic >= Euclidean, so this runs a touch longer
+                             # than the old Euclidean 60mm; re-eyeball 1-2 cases.
+OPEN_RADIUS_MM       = 4.0   # opening kernel radius. Deletes tubes thinner than
+                             # ~2*this (=8mm) diameter. Trunk/ostia (>>8mm) stay.
+                             # Raise to 5.0 to also cut up to ~10mm-diameter trunk.
+CLOSE_MM             = 1.5   # closing kernel; fills small dents/holes
+GLOB                 = "*.nii.gz"
 
 # === Timing helper ===
 class T:
@@ -67,30 +79,30 @@ class T:
     def __exit__(self, *a): print(f"    [time] {self.label}: {time.perf_counter() - self.t0:.2f}s")
 
 # === Morphology helpers ===
+def _radius_vox(mask, mm):
+    """Per-axis voxel radius approximating `mm` mm, given image spacing."""
+    return [max(1, int(round(mm / s))) for s in mask.GetSpacing()]
+
 def erode_mm(mask, mm):
-    """Binary erode by ~`mm` mm using image spacing."""
-    spacing = mask.GetSpacing()
-    return sitk.BinaryErode(mask, [max(1, int(round(mm / s))) for s in spacing])
+    """Binary erode by ~`mm` mm."""
+    return sitk.BinaryErode(mask, _radius_vox(mask, mm))
 
 def dilate_mm(mask, mm):
-    """Binary dilate by ~`mm` mm using image spacing."""
-    spacing = mask.GetSpacing()
-    return sitk.BinaryDilate(mask, [max(1, int(round(mm / s))) for s in spacing])
+    """Binary dilate by ~`mm` mm."""
+    return sitk.BinaryDilate(mask, _radius_vox(mask, mm))
+
+def open_mm(mask, mm):
+    """Plain morphological opening (erode -> dilate) at `mm` radius. Erases
+    structures thinner than ~2*mm diameter and does NOT regrow them (no geodesic
+    reconstruction). Thick body shrinks then regrows to ~original, losing only
+    surface concavities smaller than the kernel."""
+    r = _radius_vox(mask, mm)
+    return sitk.BinaryDilate(sitk.BinaryErode(mask, r), r)
 
 def close_mm(mask, mm):
-    """Binary closing (dilate then erode) by ~mm. Fills small dents/holes."""
-    spacing = mask.GetSpacing()
-    r = [max(1, int(round(mm / s))) for s in spacing]
+    """Binary closing (dilate -> erode) by ~mm. Fills small dents/holes."""
+    r = _radius_vox(mask, mm)
     return sitk.BinaryErode(sitk.BinaryDilate(mask, r), r)
-
-def open_then_reconstruct(mask, mm):
-    """Opening (erode -> dilate) at `mm` kernel, then geodesic reconstruction
-    under the original mask. Erases tubes thinner than ~2*mm diameter,
-    preserves the LA body and thick PV trunks."""
-    spacing = mask.GetSpacing()
-    r = [max(1, int(round(mm / s))) for s in spacing]
-    opened = sitk.BinaryDilate(sitk.BinaryErode(mask, r), r)
-    return sitk.BinaryReconstructionByDilation(opened, mask)
 
 # === Threshold from seed intensities ===
 def adaptive_threshold(ct, seed_mask):
@@ -124,32 +136,37 @@ def build_forbidden(seg):
         forbidden = m if forbidden is None else sitk.Or(forbidden, m)
     return forbidden, counts
 
-# === Distance-from-centroid cap (cuts distal PVs) ===
-def distance_from_centroid_cap(mask, seed, max_dist_mm):
-    """Cap mask to voxels within max_dist_mm of the seed centroid (mm)."""
+# === Geodesic distance-from-centroid cap (cuts distal PVs along the tube) ===
+def geodesic_centroid_cap(mask, seed, max_dist_mm):
+    """Cap mask to voxels within max_dist_mm GEODESIC (in-mask path) distance of
+    the LA seed centroid. Distance travels up the PV tubes instead of slicing a
+    sphere, so body voxels stay ~0 and PV voxels grow with how far they run up
+    the tube. Components not reachable from the seed are dropped (CC filter)."""
     arr = sitk.GetArrayFromImage(seed)
     zs, ys, xs = np.where(arr > 0)
     if len(zs) == 0:
         return mask
+
+    # Centroid, then snap to the nearest ACTUAL seed voxel so the trial point is
+    # guaranteed inside the mask (speed=1) even if the body is non-convex and the
+    # raw centroid would land in a concavity.
     cx, cy, cz = float(xs.mean()), float(ys.mean()), float(zs.mean())
-    centroid_phys = np.array(
-        seed.TransformContinuousIndexToPhysicalPoint((cx, cy, cz))
-    )
-    print(f"    seed centroid (mm): "
-          f"({centroid_phys[0]:.1f}, {centroid_phys[1]:.1f}, {centroid_phys[2]:.1f})")
+    d2 = (xs - cx) ** 2 + (ys - cy) ** 2 + (zs - cz) ** 2
+    j = int(np.argmin(d2))
+    seed_idx = (int(xs[j]), int(ys[j]), int(zs[j]))   # (x, y, z) index
+    print(f"    geodesic seed index (x,y,z): {seed_idx}")
 
-    size      = mask.GetSize()              # (x,y,z)
-    spacing   = np.array(mask.GetSpacing())
-    origin    = np.array(mask.GetOrigin())
-    direction = np.array(mask.GetDirection()).reshape(3, 3)
-    iz, iy, ix = np.indices((size[2], size[1], size[0]))
-    idx_mm = np.stack(
-        [ix * spacing[0], iy * spacing[1], iz * spacing[2]], axis=-1
-    )
-    phys = origin + idx_mm @ direction.T
-    dist = np.linalg.norm(phys - centroid_phys, axis=-1)
+    # Speed = 1 inside mask, 0 outside. With speed 0 the front cannot leave the
+    # mask, so FastMarching arrival time IS the in-mask geodesic distance.
+    # FastMarching is spacing-aware, so arrival is in mm.
+    speed = sitk.Cast(mask, sitk.sitkFloat32)
+    fm = sitk.FastMarchingImageFilter()
+    fm.AddTrialPoint(seed_idx)
+    fm.SetStoppingValue(max_dist_mm * 1.5)   # stop marching past the cap, for speed
+    arrival = sitk.GetArrayFromImage(fm.Execute(speed))
 
-    keep = (dist <= max_dist_mm).astype(np.uint8)
+    # Unreached / far voxels hold FastMarching's large default value -> dropped.
+    keep = (arrival <= max_dist_mm).astype(np.uint8)
     keep_img = sitk.GetImageFromArray(keep)
     keep_img.CopyInformation(mask)
     return sitk.And(mask, keep_img)
@@ -204,27 +221,24 @@ def grow_one(case):
     print(f"  after forbidden-block + largest CC: "
           f"{int(sitk.GetArrayFromImage(grown).sum())} voxels")
 
-    # 6) Distance-from-centroid cap (cuts distal PVs)
-    with T("distance-from-centroid cap"):
-        pruned = distance_from_centroid_cap(grown, la_seed,
-                                            MAX_DIST_FROM_CENTROID_MM)
-    with T("largest CC #2"):
-        pruned = largest_component(pruned)
-    print(f"  after distance cap (<{MAX_DIST_FROM_CENTROID_MM}mm from centroid): "
+    # 6) Geodesic distance cap (cuts distal PVs along the tube; drops stray CCs)
+    with T("geodesic centroid cap"):
+        pruned = geodesic_centroid_cap(grown, la_seed, MAX_GEODESIC_MM)
+    print(f"  after geodesic cap (<{MAX_GEODESIC_MM}mm in-mask from centroid): "
           f"{int(sitk.GetArrayFromImage(pruned).sum())} voxels")
 
-    # 6b) Remove thin PV remnants
-    with T(f"thin-vessel removal (open {THIN_OPEN_MM}mm)"):
-        pruned = open_then_reconstruct(pruned, THIN_OPEN_MM)
+    # 6b) Thin-branch removal: plain opening keeps only the thick trunk
+    with T(f"opening (radius {OPEN_RADIUS_MM}mm)"):
+        pruned = open_mm(pruned, OPEN_RADIUS_MM)
     with T("largest CC after opening"):
         pruned = largest_component(pruned)
-    print(f"  after thin-vessel removal: "
+    print(f"  after opening (cut <~{2*OPEN_RADIUS_MM:.0f}mm diameter): "
           f"{int(sitk.GetArrayFromImage(pruned).sum())} voxels")
 
     # 7) Closing to fill small dents/holes
     with T("closing"):
         pruned = close_mm(pruned, CLOSE_MM)
-    with T("largest CC #3"):
+    with T("largest CC #final"):
         pruned = largest_component(pruned)
 
     # 8) Save
@@ -241,6 +255,6 @@ if __name__ == "__main__":
     t_total = time.perf_counter()
     for nii in sorted(NIFTI_DIR.glob(GLOB)):
         case = nii.name.replace(".nii.gz", "")
-        print(f"\n[{case}] region-growing v6...")
+        print(f"\n[{case}] region-growing v7...")
         grow_one(case)
     print(f"\n[total] {time.perf_counter() - t_total:.1f}s")
