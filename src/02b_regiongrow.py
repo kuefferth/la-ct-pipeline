@@ -63,13 +63,51 @@ FORBIDDEN = {
 
 # === Tunables ===
 ERODE_MM             = 5.0   # seed erosion before sampling intensities + growing
-MAX_GEODESIC_MM      = 60.0  # in-mask path-distance cap from seed centroid.
-                             # Geodesic >= Euclidean, so this runs a touch longer
-                             # than the old Euclidean 60mm; re-eyeball 1-2 cases.
-OPEN_RADIUS_MM       = 4.0   # opening kernel radius. Deletes tubes thinner than
-                             # ~2*this (=8mm) diameter. Trunk/ostia (>>8mm) stay.
-                             # Raise to 5.0 to also cut up to ~10mm-diameter trunk.
-CLOSE_MM             = 1.5   # closing kernel; fills small dents/holes
+MAX_GEODESIC_MM      = 55.0  # in-mask path-distance cap from seed centroid.
+                             # Tightened 60 -> 55 post-tuning to trim PVs a touch
+                             # shorter. Geodesic >= Euclidean.
+OPEN_RADIUS_MM       = 2.0   # opening kernel radius. VALIDATED = 2.0 on the 2 legacy
+                             # + 2 pcct scrap set, paired with CLOSE_MM=0: the carina
+                             # held (the old recon2 fusion was the CLOSING, not the
+                             # opening) and r=2.0 strips more small artifacts than 1.0.
+                             # With RECON_MM matched, the body floods back so net
+                             # removal saturates; this is the chosen cleanup/detail
+                             # balance. Radius sets BOTH cutoff (2r) AND rounding (r);
+                             # 4.0 ate the LAA + ostia, so do not exceed ~3.0.
+
+# Opening mode -- how the de-potato / branch-cut step works. Opening is anti-
+# extensive (open(mask) subset of mask) so it can only REMOVE surface, never add
+# it back. That gives two endpoints and one knob between them:
+#   "plain"         : erode->dilate. The ONLY mode that severs a connected thin
+#                     tube, but rounds the body (potato) because the dilate-back
+#                     cannot restore concavities/detail it ate.
+#   "recon_full"    : open to a core, then flood it back up under the original
+#                     mask (BinaryReconstructionByDilation). Restores the body
+#                     PERFECTLY but on a single blob is ~a no-op: it also refloods
+#                     every connected branch. Use to get the crisp-body / no-cut
+#                     endpoint back.
+#   "recon_limited" : open to a core, then flood back toward the mask boundary
+#                     ONLY up to RECON_MM. Body concavities within RECON_MM
+#                     recover (de-potato); branches longer than RECON_MM regrow
+#                     just an RECON_MM stub. RECON_MM=0 == plain; large == recon_full.
+#   "none"          : no opening at all (v4 behaviour). Crispest body, no potato,
+#                     no opening-dilate bridging the LSPV/LAA carina -- but leaves
+#                     thin vessels the geodesic cap did not already trim.
+# NOTE: branches running PARALLEL/close to the LA wall have no thin neck to open
+# through -- NO morphology mode cuts them. That needs the centerline 90-deg cut.
+OPEN_MODE            = "recon_limited"
+RECON_MM             = 2.0   # only used in recon_limited: how far (mm) the opened
+                             # core floods back toward the mask boundary. Matched to
+                             # OPEN_RADIUS_MM=2.0 in the validated config. NOTE: matching
+                             # makes net removal saturate (erode r, flood back r). To
+                             # remove MORE decisively, DECOUPLE: keep this low (~1.0)
+                             # while raising OPEN_RADIUS_MM (costs a little body potato).
+
+CLOSE_MM             = 0.0   # closing DISABLED (validated). A closing dilate BRIDGES
+                             # the LSPV/LAA carina and the LPV/LA ridge -- that was the
+                             # fusion seen on the scrap set. 0 = skip closing entirely.
+                             # If tiny pinholes ever need filling, 1.0 is the ceiling;
+                             # do not go back to 2.0.
 GLOB                 = "*.nii.gz"
 
 # === Timing helper ===
@@ -103,6 +141,32 @@ def close_mm(mask, mm):
     """Binary closing (dilate -> erode) by ~mm. Fills small dents/holes."""
     r = _radius_vox(mask, mm)
     return sitk.BinaryErode(sitk.BinaryDilate(mask, r), r)
+
+def recon_by_dilation_limited(marker, mask, mm):
+    """Geodesic (mask-constrained) dilation of `marker`, capped at ~mm distance.
+    Iterated 1-voxel dilate-then-AND-mask: the marker grows back toward the mask
+    boundary up to mm, never leaving the mask. Restores body concavities the
+    opening rounded off (within mm), while a branch longer than mm only regrows
+    an mm-long stub. mm large -> approaches full reconstruction; mm 0 -> no-op."""
+    min_sp = min(mask.GetSpacing())
+    steps  = max(0, int(round(mm / min_sp)))
+    cur = marker
+    for _ in range(steps):
+        cur = sitk.And(sitk.BinaryDilate(cur, [1, 1, 1]), mask)
+    return cur
+
+def open_branchcut(mask):
+    """Branch-cut / de-potato step, dispatched on OPEN_MODE. See OPEN_MODE docs."""
+    if OPEN_MODE == "none":
+        return mask                       # v4-style: no opening at all (crispest body)
+    if OPEN_MODE == "plain":
+        return open_mm(mask, OPEN_RADIUS_MM)
+    core = open_mm(mask, OPEN_RADIUS_MM)
+    if OPEN_MODE == "recon_full":
+        return sitk.BinaryReconstructionByDilation(core, mask)
+    if OPEN_MODE == "recon_limited":
+        return recon_by_dilation_limited(core, mask, RECON_MM)
+    raise ValueError(f"unknown OPEN_MODE: {OPEN_MODE!r}")
 
 # === Threshold from seed intensities ===
 def adaptive_threshold(ct, seed_mask):
@@ -227,19 +291,21 @@ def grow_one(case):
     print(f"  after geodesic cap (<{MAX_GEODESIC_MM}mm in-mask from centroid): "
           f"{int(sitk.GetArrayFromImage(pruned).sum())} voxels")
 
-    # 6b) Thin-branch removal: plain opening keeps only the thick trunk
-    with T(f"opening (radius {OPEN_RADIUS_MM}mm)"):
-        pruned = open_mm(pruned, OPEN_RADIUS_MM)
+    # 6b) Thin-branch removal: opening (mode-dependent) keeps the thick trunk
+    with T(f"opening (mode={OPEN_MODE}, r={OPEN_RADIUS_MM}mm, recon={RECON_MM}mm)"):
+        pruned = open_branchcut(pruned)
     with T("largest CC after opening"):
         pruned = largest_component(pruned)
     print(f"  after opening (cut <~{2*OPEN_RADIUS_MM:.0f}mm diameter): "
           f"{int(sitk.GetArrayFromImage(pruned).sum())} voxels")
 
-    # 7) Closing to fill small dents/holes
-    with T("closing"):
-        pruned = close_mm(pruned, CLOSE_MM)
-    with T("largest CC #final"):
-        pruned = largest_component(pruned)
+    # 7) Closing to fill small dents/holes (skip entirely when CLOSE_MM <= 0;
+    #    a closing dilate can BRIDGE the LSPV/LAA carina or the LPV/LA ridge).
+    if CLOSE_MM > 0:
+        with T("closing"):
+            pruned = close_mm(pruned, CLOSE_MM)
+        with T("largest CC #final"):
+            pruned = largest_component(pruned)
 
     # 8) Save
     with T("write output"):

@@ -20,10 +20,17 @@ MESH_DIR = Path("derivatives/meshes")
 
 # === Tunables ===
 PAD_VOXELS        = 4       # background border added on every side; closes border-touching caps
-TAUBIN_ITER       = 50      # smoothing iterations; more = smoother, can over-smooth
+GAUSS_VAR         = 1.0     # mask pre-smooth variance (mm^2). Chosen on scrap set
+                            # (g10/t100 read smoothest). RAISES fusion risk: too high
+                            # re-closes the LSPV/LAA carina. 1.0 held on the 4 scrap
+                            # cases but RE-CHECK the carina on the full 41-case batch;
+                            # drop toward 0.6 if any tight carina fuses at mesh stage.
+TAUBIN_ITER       = 100     # smoothing iterations; more = smoother. SAFE lever for
+                            # extra smoothness (volume-preserving, cannot re-fuse).
 TAUBIN_PASS_BAND  = 0.05    # 0.01-0.2 range; lower = stronger smoothing
 DECIMATE_FRAC     = 0.7     # 0.7 = remove 70% of triangles (keep 30%)
 GLOB              = "*_LA.nii.gz"   # final masks only; ignores *_LA_seed.nii.gz
+SKIP_EXISTING     = True    # skip cases whose full VTK + STL already exist (set False to force re-mesh)
 
 # === Tiny timing helper ===
 class T:
@@ -47,7 +54,7 @@ def mask_to_mesh(mask_path: Path, case: str):
     # instead of a staircase. Gaussian variance in mm^2.
     with T("mask smoothing"):
         img_f = sitk.Cast(img, sitk.sitkFloat32)
-        img_f = sitk.DiscreteGaussian(img_f, variance=[0.6, 0.6, 0.6])
+        img_f = sitk.DiscreteGaussian(img_f, variance=[GAUSS_VAR, GAUSS_VAR, GAUSS_VAR])
     arr = sitk.GetArrayFromImage(img_f)   # shape (z, y, x), float
     spacing = img.GetSpacing()          # (x, y, z) mm
     origin  = img.GetOrigin()           # (x, y, z) world position of first voxel
@@ -103,6 +110,11 @@ if __name__ == "__main__":
         if mask_path.name.endswith("_LA_seed.nii.gz"):
             continue
         case = mask_path.name.replace("_LA.nii.gz", "")
+        out_vtk = MESH_DIR / f"{case}_LA.vtk"
+        out_stl = MESH_DIR / f"{case}_LA.stl"
+        if SKIP_EXISTING and out_vtk.exists() and out_stl.exists():
+            print(f"[{case}] mesh exists, skip")
+            continue
         print(f"\n[{case}] meshing...")
         mask_to_mesh(mask_path, case)
     print(f"\n[total] {time.perf_counter() - t_total:.1f}s")
