@@ -1,8 +1,11 @@
 """LA binary mask -> surface mesh (VTK + STL).
 
+v2 change: pad mask with a background border before marching cubes so masks
+that touch the CT FOV border get a closed (flat) cap instead of an open hole.
+
 Per case:
   derivatives/seg_la/<case>_LA.nii.gz  (final refined mask, NOT _LA_seed)
-    -> marching cubes -> largest CC -> Taubin smoothing
+    -> pad -> marching cubes -> largest CC -> Taubin smoothing
     -> save full + decimated meshes
     -> derivatives/meshes/<case>_LA.{vtk,stl}, <case>_LA_decimated.stl
 """
@@ -16,8 +19,9 @@ LA_DIR   = Path("derivatives/seg_la")
 MESH_DIR = Path("derivatives/meshes")
 
 # === Tunables ===
+PAD_VOXELS        = 4       # background border added on every side; closes border-touching caps
 TAUBIN_ITER       = 50      # smoothing iterations; more = smoother, can over-smooth
-TAUBIN_PASS_BAND  = 0.05     # 0.01-0.2 range; lower = stronger smoothing
+TAUBIN_PASS_BAND  = 0.05    # 0.01-0.2 range; lower = stronger smoothing
 DECIMATE_FRAC     = 0.7     # 0.7 = remove 70% of triangles (keep 30%)
 GLOB              = "*_LA.nii.gz"   # final masks only; ignores *_LA_seed.nii.gz
 
@@ -30,6 +34,15 @@ class T:
 def mask_to_mesh(mask_path: Path, case: str):
     with T("read mask"):
         img = sitk.ReadImage(str(mask_path))
+
+    # Pad with a background (0) border. Any foreground voxel that sat on the
+    # volume edge now gets a 0 neighbour, so marching cubes produces a 0.5
+    # crossing there and caps the surface. ConstantPad updates the origin, so
+    # the pyvista grid below stays in correct world coordinates.
+    with T("pad border"):
+        p = [PAD_VOXELS] * 3
+        img = sitk.ConstantPad(img, p, p, 0)
+
     # Smooth the binary mask slightly so marching cubes gets sub-voxel detail
     # instead of a staircase. Gaussian variance in mm^2.
     with T("mask smoothing"):
@@ -40,8 +53,7 @@ def mask_to_mesh(mask_path: Path, case: str):
     origin  = img.GetOrigin()           # (x, y, z) world position of first voxel
 
     # Build pyvista grid in patient/world coords.
-    # Use point_data (not cell_data) so contour iso=0.5 lands at the voxel boundary,
-    # and dimensions = arr.shape (NOT shape+1) for point-centered scalars.
+    # point_data + dimensions = arr.shape so contour iso=0.5 lands at the voxel boundary.
     with T("build grid"):
         grid = pv.ImageData(
             dimensions=np.array(arr.shape[::-1]),   # (nx, ny, nz)
@@ -88,7 +100,6 @@ if __name__ == "__main__":
     MESH_DIR.mkdir(parents=True, exist_ok=True)
     t_total = time.perf_counter()
     for mask_path in sorted(LA_DIR.glob(GLOB)):
-        # Skip seed files (we only want the refined _LA.nii.gz, not _LA_seed.nii.gz)
         if mask_path.name.endswith("_LA_seed.nii.gz"):
             continue
         case = mask_path.name.replace("_LA.nii.gz", "")

@@ -1,17 +1,17 @@
-"""LA refinement v5: TotalSeg LA seed -> region grow -> LV+aorta block ->
+"""LA refinement v6: TotalSeg LA seed -> region grow -> forbidden-neighbour block ->
 distance-from-centroid cap -> thin-vessel removal -> closing.
+
+v6 change: forbidden zone now includes RA + RV + PA (was LV + aorta only).
+Seals region-grow leaks into the pulmonary artery and right ventricle.
 
 Pipeline:
   1. Erode TotalSeg LA mask by ERODE_MM -> seed
   2. Adaptive threshold from CT intensities inside seed (percentile-based)
   3. Region grow from seed under that threshold window
-  4. Subtract LV (raw) + Aorta (dilated 1.5mm) -> preserves mitral plane,
-     prevents aortic root leaks
+  4. Subtract forbidden neighbours (LV, RA raw; aorta, RV, PA dilated)
   5. Keep largest connected component
   6. Cap to voxels within MAX_DIST_FROM_CENTROID_MM of LA seed centroid
-     (cuts distal PV branches)
-  6b. Remove thin PV remnants via morphological opening + geodesic reconstruction
-      (erases tubes thinner than ~2*THIN_OPEN_MM diameter, preserves LA body)
+  6b. Remove thin PV remnants via opening + geodesic reconstruction
   7. Closing to fill small dents/holes
 """
 
@@ -32,15 +32,32 @@ LA_DIR    = Path("derivatives/seg_la")
 # === Label indices in heartchambers_highres ===
 LA_LABEL    = 2   # heart_atrium_left
 LV_LABEL    = 3   # heart_ventricle_left
+RA_LABEL    = 4   # heart_atrium_right
+RV_LABEL    = 5   # heart_ventricle_right
 AORTA_LABEL = 6   # aorta
+PA_LABEL    = 7   # pulmonary_artery
+
+# === Forbidden neighbours: label -> dilation (mm) ===
+# Subtracting these seals leaks across thin shared walls. largest-CC then drops
+# whatever the dilated barrier severed.
+#   LV  raw : dilation would cut the mitral plane (we want LA-LV interface intact)
+#   RA  raw : interatrial septum is thin; dilation would eat into LA
+#   aorta   : TotalSeg under-segments the root, pad a bit
+#   RV / PA : main leak targets; pad to seal the thin wall the grow jumps
+# If PA leaks persist, bump PA to 2.0-2.5, but watch the left superior PV ostium.
+FORBIDDEN = {
+    LV_LABEL:    0.0,
+    RA_LABEL:    0.0,
+    AORTA_LABEL: 1.5,
+    RV_LABEL:    1.5,
+    PA_LABEL:    1.5,
+}
 
 # === Tunables ===
 ERODE_MM                  = 5.0   # seed erosion before sampling intensities + growing
-LV_DILATE_MM              = 0.0   # raw LV (dilation cuts mitral plane)
-AORTA_DILATE_MM           = 0.0   # pad undersegmented aorta
-MAX_DIST_FROM_CENTROID_MM = 55.0  # cap on distance from LA seed centroid (cuts distal PVs)
-THIN_OPEN_MM              = 2.5     # opening kernel; erases tubes thinner than ~5 mm diameter
-CLOSE_MM                  = 1.0   # closing kernel; fills small dents/holes
+MAX_DIST_FROM_CENTROID_MM = 60.0  # cap on distance from LA seed centroid (cuts distal PVs)
+THIN_OPEN_MM              = 2.5   # opening kernel; erases tubes thinner than ~5mm diameter
+CLOSE_MM                  = 1.5   # closing kernel; fills small dents/holes
 GLOB                      = "*.nii.gz"
 
 # === Timing helper ===
@@ -67,6 +84,9 @@ def close_mm(mask, mm):
     return sitk.BinaryErode(sitk.BinaryDilate(mask, r), r)
 
 def open_then_reconstruct(mask, mm):
+    """Opening (erode -> dilate) at `mm` kernel, then geodesic reconstruction
+    under the original mask. Erases tubes thinner than ~2*mm diameter,
+    preserves the LA body and thick PV trunks."""
     spacing = mask.GetSpacing()
     r = [max(1, int(round(mm / s))) for s in spacing]
     opened = sitk.BinaryDilate(sitk.BinaryErode(mask, r), r)
@@ -90,6 +110,19 @@ def largest_component(mask):
     cc  = sitk.ConnectedComponent(mask)
     rel = sitk.RelabelComponent(cc, sortByObjectSize=True)
     return sitk.BinaryThreshold(rel, 1, 1, 1, 0)
+
+# === Forbidden mask builder ===
+def build_forbidden(seg):
+    """Union of forbidden-neighbour labels, each dilated per FORBIDDEN dict."""
+    forbidden = None
+    counts = {}
+    for label, dmm in FORBIDDEN.items():
+        m = sitk.BinaryThreshold(seg, label, label, 1, 0)
+        if dmm > 0:
+            m = dilate_mm(m, dmm)
+        counts[label] = int(sitk.GetArrayFromImage(m).sum())
+        forbidden = m if forbidden is None else sitk.Or(forbidden, m)
+    return forbidden, counts
 
 # === Distance-from-centroid cap (cuts distal PVs) ===
 def distance_from_centroid_cap(mask, seed, max_dist_mm):
@@ -144,16 +177,10 @@ def grow_one(case):
     # 2) Threshold
     lo, hi = adaptive_threshold(ct, la_seed)
 
-    # 3) Forbidden zone: LV (raw) + aorta (dilated)
-    with T("LV + aorta mask"):
-        lv = sitk.BinaryThreshold(seg, LV_LABEL,    LV_LABEL,    1, 0)
-        ao = sitk.BinaryThreshold(seg, AORTA_LABEL, AORTA_LABEL, 1, 0)
-        ao_block = ao if AORTA_DILATE_MM <= 0 else dilate_mm(ao, AORTA_DILATE_MM)
-        lv_block = lv if LV_DILATE_MM <= 0 else dilate_mm(lv, LV_DILATE_MM)
-        forbidden = sitk.Or(lv_block, ao_block)
-    print(f"  forbidden voxels: "
-          f"LV={int(sitk.GetArrayFromImage(lv_block).sum())}  "
-          f"Aorta(+{AORTA_DILATE_MM}mm)={int(sitk.GetArrayFromImage(ao_block).sum())}")
+    # 3) Forbidden zone: LV + RA (raw) + aorta + RV + PA (dilated)
+    with T("forbidden mask"):
+        forbidden, counts = build_forbidden(seg)
+    print("  forbidden voxels: " + "  ".join(f"L{k}={v}" for k, v in counts.items()))
 
     # 4) Seed list for ConnectedThreshold (subsample for speed; result identical)
     with T("seed list"):
@@ -170,7 +197,7 @@ def grow_one(case):
         grown = sitk.ConnectedThreshold(ct, seedList=seed_list,
                                         lower=float(lo), upper=float(hi),
                                         replaceValue=1)
-    with T("subtract LV + aorta"):
+    with T("subtract forbidden"):
         grown = sitk.And(grown, sitk.Not(forbidden))
     with T("largest CC #1"):
         grown = largest_component(grown)
@@ -214,6 +241,6 @@ if __name__ == "__main__":
     t_total = time.perf_counter()
     for nii in sorted(NIFTI_DIR.glob(GLOB)):
         case = nii.name.replace(".nii.gz", "")
-        print(f"\n[{case}] region-growing v5...")
+        print(f"\n[{case}] region-growing v6...")
         grow_one(case)
     print(f"\n[total] {time.perf_counter() - t_total:.1f}s")
