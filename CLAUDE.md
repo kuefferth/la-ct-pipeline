@@ -54,18 +54,17 @@ Claude Code auto-loads `CLAUDE.md` from there. Rename if you prefer.
 ## Current pipeline
 
 ```
-data/<case>/                                  DICOMs (gitignored)
-  -> 01_dicom_to_nifti.py                      smart series selection
-derivatives/nifti/<case>.nii.gz
+data/<case>.zip                               DICOMs (gitignored)
+  -> 01_dicom_to_nifti.py                      series selection + per-patient dedup
+derivatives/nifti/<case>__{pcct,legacy}.nii.gz  one per patient (pcct preferred)
   -> 02_segment.py                             TotalSeg heartchambers_highres (CPU)
 derivatives/seg_full/<case>_chambers.nii.gz    multi-label (myo,LA,LV,RA,RV,aorta,PA)
 derivatives/seg_la/<case>_LA_seed.nii.gz       TotalSeg LA only (seed reference)
   -> 02b_regiongrow.py                         refinement (see below)
 derivatives/seg_la/<case>_LA.nii.gz            binary LA+PV-cuffs (final)
-  -> 03_mesh.py                                mask -> marching cubes -> Taubin
-derivatives/meshes/<case>_LA.{vtk,stl}         full-res
-derivatives/meshes/<case>_LA_decimated.{vtk,stl}  decimated (30% tris)
-  -> 03b_canonicalize.py                       translation-only recenter + 4x4 sidecar
+  -> 03_mesh.py                                mask -> marching cubes -> Taubin -> decimate
+derivatives/meshes/<case>_LA.{vtk,stl}         decimated mesh (30% tris; ONLY output)
+  -> 03b_canonicalize.py  (optional, not in run_all)  translation recenter + 4x4 sidecar
 derivatives/canonical/<case>_LA_T.npy          4x4 world->canonical
 derivatives/canonical/<case>_LA_canonical.stl
 ```
@@ -82,6 +81,14 @@ plus probes `00d_why_skipped`, `00e_oldscanner_probe`, `00f_phase_probe`,
 - ReconstructionDiameter < 250 mm (cardiac FOV; thorax recons ~368)
 - AcquisitionNumber == 501 (diastolic arterial)
 - Multiple matches -> lowest SeriesNumber + warn.
+- PER-PATIENT DEDUP: some patients ship two studies (two zips, different do-numbers)
+  -- a 0.4mm pcct recon AND a 0.75mm legacy recon. Rule: ONE series/patient, prefer
+  pcct (high-res). Implemented in 01: patient_id = token before first `_0___`;
+  PROFILE_PRIORITY pcct<legacy; post-loop removes the superseded legacy nifti; a
+  pcct-sibling skip avoids re-extracting on reruns. Dedup is at the nifti stage, so
+  02/02b/03 (which iterate over existing nifti) see one-per-patient automatically.
+  NOTE: this does NOT catch cross-ID DATA duplicates (same scan under two IDs, e.g.
+  114==1111, 1348==4736 were byte-identical) -- only content-hashing finds those.
 - IMPORTANT kernel fix (from case 1111 / production anonymization): the
   anonymizer exports ConvolutionKernel as a MULTI-VALUED element
   (`['Bv40f','3']`), not a plain string. `str(...)` of that never equals
@@ -89,10 +96,14 @@ plus probes `00d_why_skipped`, `00e_oldscanner_probe`, `00f_phase_probe`,
   `kernel_str()` helper that returns the first element in both cases. All ~3k
   production cases will have the multi-valued form, so this fix is load-bearing.
 
-### Region-grow refinement (02b) — current = v7
+### Region-grow refinement (02b) — current = v8
 
 1. Seed = TotalSeg LA (label 2) eroded by 5 mm.
-2. Adaptive HU threshold = [p2-50, p98+150] of intensities inside eroded seed.
+2. Adaptive HU threshold = [p2-130, p98+150] of intensities inside eroded seed
+   (floor 120 HU). Lower margin widened in steps 50 -> 100 -> 130 to reach dim blood
+   in distal PV segments (PVs came up short at -50 and -100). v6 forbidden blockers
+   keep the wider window from spilling. NEXT lever if still short: lower the 120 floor
+   (legacy cases clamp there), not the margin.
 3. SimpleITK ConnectedThreshold from ~1000 sub-sampled seed voxels.
 4. Forbidden zone subtracted (seals region-grow leaks across thin shared walls):
    - LV (label 3) raw, RA (label 4) raw  -- dilation would cut the mitral plane /
@@ -128,14 +139,17 @@ OPEN_RADIUS_MM=2.0, RECON_MM=2.0, CLOSE_MM=0. New OPEN_MODE options: "plain",
   border-touching masks become watertight instead of open. ADDED to fix open
   meshes seen on PA-leak cases and on PVs running vertically to the scan border.
 - Gaussian pre-smooth (GAUSS_VAR variance mm^2) for sub-voxel marching-cubes detail.
-  Set to 1.0 post-tuning (smoothest of the scrap set). WARNING: GAUSS_VAR is the
-  fusion-risky knob -- too high re-closes the carina the CLOSE_MM=0 mask kept open.
-  Re-check carinas on the full batch; drop toward 0.6 if any tight carina fuses.
+  Set to 0.7 post-sweep (g1.0 was over-smoothed vs the crisp masks). WARNING: GAUSS_VAR
+  is the fusion-risky knob + the detail-eater -- too high re-closes the carina the
+  CLOSE_MM=0 mask kept open. Drop toward 0.5 if any tight carina fuses.
 - Marching cubes iso=0.5 (point_data, dims = arr.shape).
-- Largest CC, Taubin smoothing (TAUBIN_ITER=100, pass_band 0.05, volume-preserving),
+- Largest CC, Taubin smoothing (TAUBIN_ITER=60, pass_band 0.05, volume-preserving),
   consistent outward normals. Taubin is the SAFE smoothness lever (cannot re-fuse).
-- Save full + decimated (30% tris) as VTK + STL. SKIP_EXISTING skips cases whose
-  full VTK + STL already exist.
+- Decimate (30% tris) and save as the SINGLE output `<case>_LA.{vtk,stl}`. Full-res
+  is no longer written (large, no visible quality gain). SKIP_EXISTING skips cases
+  whose VTK+STL already exist (set False / pass case args to force a re-mesh).
+- Smoothing was tuned via `src/_smooth_sweep.py` (renders a g/t ladder to
+  `_scrap/smooth_test/` for visual QC). Validated = g0.7/t60.
 
 ### Canonicalization (03b)
 
@@ -188,6 +202,14 @@ OPEN_RADIUS_MM=2.0, RECON_MM=2.0, CLOSE_MM=0. New OPEN_MODE options: "plain",
   boundary. No true late-enhancement cardiac-res scan exists in this dataset.
 - DIVAID and AugmentA operate on already-segmented MESHES, not voxels. The real
   bottleneck is CT-voxels -> closed LA surface, which is what this pipeline solves.
+  UPDATE (2026-06): DIVAID is open-source (gitlab.kit.edu/kit/ibt-public/divaid,
+  Python; Loewe/KIT-IBT) and does MORE than parcellation -- it auto-CLIPS PVs (81%
+  correct) + annotates orifices (100%) and divides the LA into the EHRA/EACVI
+  15-segment model (Dice 0.98 vs experts, validated on 140 geometries incl EAM). So
+  it is a strong candidate to (a) replace the planned vmtk PV centerline cuts and
+  (b) give the canonical regional frame for EAM/outcome mapping. Consumes the surface
+  mesh this pipeline produces. EVALUATE NEXT (next major step). Confirm its input
+  needs (mesh format, single-LA vs bi-atrial, watertight/orientation) from the repo.
 - Pipeline reverts cleanly; commit working state after every meaningful change;
   verify git state before destructive actions.
 - POST-TUNING (2 legacy + 2 pcct scrap set, derivatives/_scrap, gitignored):
@@ -201,26 +223,36 @@ OPEN_RADIUS_MM=2.0, RECON_MM=2.0, CLOSE_MM=0. New OPEN_MODE options: "plain",
   - Smoothness: Taubin iters = safe (volume-preserving, cannot change topology /
     re-fuse). Gaussian mask blur = risky (re-closes carina). Add smoothness via
     Taubin first.
+- SMOOTHING SWEEP (src/_smooth_sweep.py, 854/540/2643 across a g/t ladder): g1.0/t100
+  was over-smoothed vs the crisp masks. Mechanism confirmed: Gaussian blur MOVES the
+  iso-surface (vertex count drops, real detail lost) while Taubin only relaxes vertex
+  positions (count preserved). Picked g0.7/t60 (crisp but not staircased).
+- DECIMATED-ONLY OUTPUT: decimated (30% tris) is visually indistinguishable from
+  full-res here, and full-res files were large -> 03 now writes ONLY the decimated
+  mesh as `<case>_LA.{vtk,stl}`; 03b reads it directly.
+- DATA-DUP CHECK: content-hash the nifti when curating a cohort. Patient-ID dedup
+  (01) misses same-scan-under-two-IDs duplicates (114==1111, 1348==4736 were found
+  byte-identical; 1111 + the 47xx samples are being removed by the user).
 
 ## Status & open issues / roadmap
 
-- Steps 0-3 + 03b working. A ~40-case batch run completed on the PRIOR version and
-  surfaced two real bugs: PA/RV leaks (11/16 legacy, 6/20 PCCT) and open meshes on
-  border-touching cases.
-- v6 (RV+PA forbidden), v7 (geodesic cap), the mesh 4-voxel pad, and the post-tuning
-  config (recon_limited r=2/recon=2, CLOSE=0, geodesic 55, mesh g1.0/t100) address
-  those bugs + the carina fusion. RUNNING the full 41-case batch now to confirm on
-  all cases (re-run 02b then 03; 01/02 are idempotent and reused). Spot-check
-  carinas (Gaussian 1.0 risk) and PA/RV leaks on the output.
-- Residual medium PV stumps remain after r=2 opening (acceptable for a first
-  geometry handoff). The CLEAN fix for "keep LA body + LAA crisp, cut each PV
-  perpendicular at a set distance from its ostium" is vmtk centerline cut-planes -
-  the planned next milestone. Morphology cannot do this (radius couples cutoff and
-  rounding). Mitral annulus plane cut also planned.
-- PV ostia refinement candidate: DTU LAA-Net weights (arXiv 2510.06090).
-- Scaling to ~2000: CPU ~5-6 min/case ~= 7 days. Options: cloud GPU
-  (Colab Pro / RunPod T4 ~$0.30-0.50/hr, est ~$15 total) or better local/HPC.
-  Consider containerizing (Docker) for portable deploy.
+- TUNING DONE (2026-06). Steps 01-03 working and tuned; 39-patient cohort validated.
+  Final config: 01 per-patient dedup; 02b threshold p2-130 / geodesic 55 / forbidden
+  RV+PA+aorta +1.5 / recon_limited r2 recon2 / CLOSE=0; 03 mesh pad 4 / g0.7 / t60 /
+  decimated-only. Resolved across the iterations: PA/RV leaks (v6 forbidden), open
+  meshes (4-voxel pad), carina fusion (CLOSE=0), short distal PVs (threshold -50->130),
+  over-smoothing (g1.0/t100 -> g0.7/t60), duplicate patients (dedup) + duplicate data
+  (content-hash; user removing 1111 + 47xx samples -> clean ~33-case production set).
+- NEXT MAJOR STEP: scale-up trial on ~200 cases (watch series-selection no_match like
+  2096, PA/RV leaks, carinas). Then evaluate DIVAID (open source, KIT-IBT) for PV
+  clipping + EHRA/EACVI 15-segment regional parcellation -- likely replaces the planned
+  vmtk PV centerline cuts AND provides the canonical regional frame for EAM/outcome.
+- Residual medium PV stumps remain after r=2 opening (acceptable for a first geometry
+  handoff; DIVAID's clipping is the intended fix). Mitral annulus plane cut still TBD.
+- 03b_canonicalize NOT in run_all; run separately when canonical outputs are needed
+  (derivatives/canonical/ goes stale after a re-mesh).
+- Scaling to ~2000: CPU ~6 min/case ~= ~8 days. Options: cloud GPU (RunPod/Colab T4
+  ~$0.30-0.50/hr) or local/HPC; consider Docker for portable deploy.
 - Data governance: moving patient CT to home machines or across borders to Oxford
   needs explicit DTA coverage. Verify with the DPO before the first Oxford visit.
 
@@ -228,5 +260,6 @@ OPEN_RADIUS_MM=2.0, RECON_MM=2.0, CLOSE_MM=0. New OPEN_MODE options: "plain",
 
 - Mesh format: VTK, STL, or both? Target vertex count (drives decimation)?
 - Coordinate / orientation convention (LPS vs RAS)?
+- Regional model: is the EHRA/EACVI 15-segment scheme (DIVAID) the parcellation they want?
 - Per-case quality metrics they want logged?
 - Any GPU/HPC on their side for the 2000-case run, or cloud?

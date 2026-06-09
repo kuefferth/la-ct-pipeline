@@ -1,87 +1,94 @@
 LA-CT segmentation pipeline (Bern → Oxford)
 
 INPUT
-- Siemens dual-source cardiac CT, DICOM
+- Siemens cardiac CT, DICOM (photon-counting "pcct" and older dual-source "legacy")
 - ECG-gated, ~30 series/study (multiple recons)
-- Auto-selected: Bv40f kernel, 0.4mm slice, cardiac FOV (<250mm),
-  AcqNum 501 = diastolic 70%+ RR
+- Auto-selected per scanner profile:
+    pcct   : Bv40f kernel, 0.4mm slice, cardiac FOV (<250mm), AcqNum 501 (diastolic 70%+ RR)
+    legacy : I30f kernel, 0.75mm slice, cardiac FOV, ORIGINAL, arterial LA phase
+- Per-patient dedup: when a patient ships both a pcct and a legacy study, keep the
+  high-res pcct and drop the legacy (one geometry per patient).
 
-PIPELINE (Python, fully automated)
+PIPELINE (Python, fully automated; orchestrated by run_all.py = steps 01,02,02b,03)
 
 1. DICOM → NIfTI  (01_dicom_to_nifti.py)
-   - SimpleITK series reader
-   - Smart series selection by DICOM tags (kernel, thickness, FOV, acq#)
+   - SimpleITK series reader; smart series selection by DICOM tags
+   - Patient-level dedup (pcct preferred over legacy)
+   - Output suffixed with profile: <case>__pcct.nii.gz / <case>__legacy.nii.gz
 
 2. Coarse LA segmentation  (02_segment.py)
    - TotalSegmentator heartchambers_highres (nnU-Net v2, CPU)
    - Output: multi-label volume (myo, LA, LV, RA, RV, aorta, PA)
-   - LA label = 2; used as seed only (PVs cut, LAA undershot, walls
-     undershot — boundaries not reliable on their own)
+   - LA label = 2; used as SEED only (PVs cut, walls undershot on their own)
 
-3. Refinement via region growing  (02b_regiongrow.py, v7)
+3. Refinement via region growing  (02b_regiongrow.py)
    - Seed = TotalSeg LA eroded by 5 mm
-   - Adaptive threshold: [p2−50, p98+150] HU of intensities inside seed
+   - Adaptive threshold: [p2−130, p98+150] HU of intensities inside seed
+     (floor 120 HU; widened in steps from −50 to reach dim distal-PV blood)
    - SimpleITK ConnectedThreshold from ~1000 sub-sampled seed voxels
    - Forbidden zone (subtracted to seal region-grow leaks):
        LV (raw), RA (raw)       — thin shared walls; dilating would cut the
                                   mitral plane / eat into interatrial septum
-       aorta, RV, PA (+1.5 mm)  — padded to seal the wall the grow jumps;
-                                  RV + PA added in v6 to stop PA/RV leaks
+       aorta, RV, PA (+1.5 mm)  — padded to seal the wall the grow jumps
    - Largest connected component
-   - Geodesic distance cap: drop voxels >60 mm IN-MASK path distance from the
-     LA seed centroid. Follows the PV tubes instead of slicing a sphere, and
-     drops any component not connected to the seed. (Was Euclidean in v5/v6.)
-   - Thin-branch removal: plain morphological opening (4 mm radius, NO
-     reconstruction). Deletes connected tubes thinner than ~8 mm diameter,
-     keeps thick PV trunk + ostia. (v5/v6 used opening + geodesic
-     reconstruction, which regrew every connected tube → near no-op; dropped.)
-   - Closing (1.5 mm): fills small wall dents
+   - Geodesic distance cap: drop voxels >55 mm IN-MASK path distance from the LA
+     seed centroid (follows the PV tubes; drops components not wired to the seed).
+     THIS step does the body/PV shaping; morphology moves volume <2%.
+   - Thin-branch removal: opening, mode "recon_limited" (open to a 2 mm core, flood
+     back up to 2 mm) — strips small free-standing artifacts, body floods back.
+   - Closing DISABLED (it bridged the LSPV/LAA carina + LPV/LA ridge = fusion).
 
 4. Meshing  (03_mesh.py)
-   - Pad mask with 4-voxel background border before contouring
-     (closes caps where the mask touches the CT FOV edge → watertight)
-   - Gaussian pre-smooth (variance 0.6 mm²) for sub-voxel detail
-   - Marching cubes (iso=0.5)
-   - Largest connected component
-   - Taubin smoothing (50 iters, pass_band 0.05) — volume-preserving
+   - Pad mask with 4-voxel background border before contouring (closes caps where
+     the mask touches the CT FOV edge → watertight)
+   - Gaussian pre-smooth (variance 0.7 mm²) for sub-voxel detail
+   - Marching cubes (iso=0.5) → largest connected component
+   - Taubin smoothing (60 iters, pass_band 0.05) — volume-preserving
    - Consistent outward-pointing normals
-   - Save full-resolution + decimated (30% triangles) as VTK + STL
+   - Decimate (30% triangles) and save as the SINGLE output (VTK + STL).
+     Full-res is no longer written (large, no visible quality gain vs decimated).
+   - Smoothing tuned on a sweep (src/_smooth_sweep.py): g0.7/t60. Gaussian is the
+     detail-eater + carina-fusion risk; Taubin is the safe (volume-preserving) lever.
+
+(03b_canonicalize.py — optional, not in run_all) translation-only recenter to the LA
+   centroid + 4×4 sidecar (.npy) for inverse-mapping EAM/outcome points. Scale kept
+   (LA size is clinically meaningful). Output: derivatives/canonical/.
 
 OUTPUT
 - Binary LA+PV-cuffs mask (NIfTI, voxel-accurate)
-- Triangulated surface mesh (VTK + STL, full + decimated)
-- Single connected structure, no manual annotation
+- Triangulated surface mesh, decimated (VTK + STL) — single connected structure
 - TotalSeg seed kept as *_LA_seed.nii.gz for reference
 
 RUNTIME (per case)
 - DICOM → NIfTI:     ~10 s
 - TotalSeg (CPU):    ~5 min  (GPU silently crashes on GTX 1060 + Win 10)
-- Region grow:       ~30 s
+- Region grow:       ~50 s
 - Meshing:           ~10 s
 - Total:             ~6 min / case
 
 KNOWN LIMITATIONS
-- PV cut is diameter + length based, not anatomical. Production fix =
-  vmtk centerline cut-planes at PV ostia (planned).
-- LAA not preserved by the opening step (thin appendage tips erased).
-  Acceptable per scope: contrast-filled LAAs are trunk-sized and survive;
-  unfilled LAAs are not in the segmentation anyway.
-- Valve replacements / LAA plugs cause local artifacts (ignored for now)
+- PV cut is diameter + length based, not anatomical. Candidate production fix =
+  DIVAID (KIT-IBT, open source) which auto-clips PVs + annotates orifices and divides
+  the LA into the EHRA/EACVI 15-segment model — operates on the surface mesh this
+  pipeline produces. Evaluate next. (Was: vmtk centerline cut-planes.)
+- LAA not preserved by the opening step (thin appendage tips erased). Acceptable per
+  scope: contrast-filled LAAs are trunk-sized and survive; unfilled LAAs are not in
+  the segmentation anyway.
+- Valve replacements / LAA plugs cause local artifacts (ignored for now).
 
 STACK
 - Python 3.11, SimpleITK, TotalSegmentator (nnU-Net v2), pyvista, numpy
 - Code: github.com/kuefferth/la-ct-pipeline
 
 STATUS
-- Steps 0–3 working; ~40-case batch run completed on prior version
-- v6 (PA/RV leak fix) + v7 (geodesic cap, thick-trunk opening) + mesh
-  border-pad implemented; pending re-validation on the 40-case batch
-- Next: vmtk centerline PV cuts; GPU/cloud for the 2000-case scale
+- Steps 01–03 working and tuned. 39-patient cohort validated (p2−130 threshold,
+  g0.7/t60 smoothing, decimated-only output, per-patient dedup).
+- Next: scale-up trial run on ~200 cases; evaluate DIVAID for PV clipping + regional
+  segmentation; GPU/cloud for the full ~2000-case scale.
 
 OPEN QUESTIONS FOR OXFORD
-- Mesh format preference: VTK, STL, or both?
-- Target vertex count for DL training (drives decimation level)?
+- Mesh format preference: VTK, STL, or both? Target vertex count (drives decimation)?
 - Coordinate system / orientation conventions (LPS vs RAS, etc.)?
 - Quality metrics they want logged per case?
-- For scaling to ~2000 cases: do they have GPU/HPC we could leverage,
-  or should we use cloud (Colab Pro / RunPod ~ $0.30-0.50/hr T4)?
+- Regional model: is the EHRA/EACVI 15-segment (DIVAID) the parcellation they want?
+- For scaling to ~2000 cases: GPU/HPC on their side, or cloud (RunPod/Colab T4)?
