@@ -10,6 +10,13 @@ Accepts unzipped case folders (data/<case>/) and per-case zips (data/<case>.zip)
 Output NIfTI is suffixed with the profile that matched: <case>__pcct.nii.gz or
 <case>__legacy.nii.gz, so the cohort is visible downstream. A selection_log.csv
 (UTF-8 BOM) records what was chosen per case.
+
+Per-patient dedup: some patients ship two studies (two zips, different do-numbers)
+-- a high-res 0.4mm pcct recon AND a low-res 0.75mm legacy recon of the same CT.
+We want ONE series per patient, so when both exist we keep the pcct (high-res) and
+drop the legacy. Patient ID = the token before the first '_0___' study separator.
+Dedup happens at the NIfTI stage (here), so 02/02b/03 -- which iterate over whatever
+NIfTI exists -- naturally see one-per-patient with no per-stage dedup needed.
 """
 import re
 import csv
@@ -158,6 +165,15 @@ def pick_legacy(series):
 
 PROFILES = [("pcct", pick_pcct), ("legacy", pick_legacy)]
 
+# Profile preference for per-patient dedup: keep the lowest-priority number.
+# pcct (0.4mm) beats legacy (0.75mm) when one patient has both.
+PROFILE_PRIORITY = {"pcct": 0, "legacy": 1}
+
+def patient_id(case_name: str) -> str:
+    """Patient ID = token before the first '_0___' study separator. Falls back to
+    the whole name (e.g. the un-suffixed sample cases 4733-4738)."""
+    return case_name.split("_0___")[0]
+
 # === Conversion ===
 def convert(items, out_path: Path):
     """Convert a list of (path, ds) DICOM files into a NIfTI volume."""
@@ -206,6 +222,20 @@ if __name__ == "__main__":
                           existing[0].name])
             continue
 
+        # Dedup skip: if a pcct survivor already exists for this patient from a
+        # DIFFERENT study, this entry is a superseded duplicate -- skip without
+        # extracting. (On a fresh run the loser may still be produced transiently
+        # and removed by the post-loop dedup; this just avoids redundant work on
+        # reruns.)
+        pid = patient_id(case_name)
+        pcct_sib = [p for p in OUT_ROOT.glob(f"{pid}_*__pcct.nii.gz")
+                    if not p.name.startswith(f"{case_name}__")]
+        if pcct_sib:
+            print(f"  [skip] superseded by pcct sibling: {pcct_sib[0].name}")
+            log.writerow([case_name, "", "", "", "", "", "", "skip_dup_pcct",
+                          pcct_sib[0].name])
+            continue
+
         with case_source(entry) as case_dir:
             series = group_series(case_dir)
 
@@ -232,6 +262,32 @@ if __name__ == "__main__":
             convert(chosen["items"], out_path)
             log.writerow([case_name, prof_name, chosen["ser"], chosen["acq"],
                           tp, f"{chosen['fov']:.1f}", n, "ok", out_path.name])
+
+    # === Per-patient dedup: keep one series per patient (prefer pcct over legacy).
+    # Self-healing and idempotent -- scans whatever NIfTI exists, groups by patient,
+    # and removes the lower-priority recon(s) when a higher-priority one is present.
+    # Only the cheap NIfTI is deleted here; the source zip stays in data/ so the
+    # decision is reversible by re-running. Downstream stages then never see it.
+    by_patient = defaultdict(list)
+    for p in OUT_ROOT.glob("*__*.nii.gz"):
+        base = p.name[:-len(".nii.gz")]
+        stem, _, prof = base.rpartition("__")
+        by_patient[patient_id(stem)].append((prof, p))
+    for pid, lst in by_patient.items():
+        if len(lst) < 2:
+            continue
+        known = [prof for prof, _ in lst if prof in PROFILE_PRIORITY]
+        if not known:
+            continue
+        best = min(known, key=lambda pr: PROFILE_PRIORITY[pr])
+        keep_prio = PROFILE_PRIORITY[best]
+        for prof, p in lst:
+            if PROFILE_PRIORITY.get(prof, 99) > keep_prio:
+                print(f"  [dedup] patient {pid}: removing {p.name} "
+                      f"(superseded by '{best}')")
+                log.writerow([p.name[:-len('.nii.gz')], prof, "", "", "", "", "",
+                              "removed_dup", f"kept_{best}"])
+                p.unlink()
 
     log_f.close()
     print(f"\n[log] wrote {LOG_PATH}")

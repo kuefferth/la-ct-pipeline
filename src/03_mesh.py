@@ -30,7 +30,11 @@ TAUBIN_ITER       = 100     # smoothing iterations; more = smoother. SAFE lever 
 TAUBIN_PASS_BAND  = 0.05    # 0.01-0.2 range; lower = stronger smoothing
 DECIMATE_FRAC     = 0.7     # 0.7 = remove 70% of triangles (keep 30%)
 GLOB              = "*_LA.nii.gz"   # final masks only; ignores *_LA_seed.nii.gz
-SKIP_EXISTING     = True    # skip cases whose full VTK + STL already exist (set False to force re-mesh)
+SKIP_EXISTING     = False   # FALSE for the full re-threshold batch: 02b overwrites every
+                            # mask (new p2-100 window), so all meshes must regenerate or
+                            # they go stale vs their mask. Flip back to True afterward for
+                            # fast incremental runs. (Passing explicit case args also forces
+                            # a re-mesh regardless of this flag.)
 
 # === Tiny timing helper ===
 class T:
@@ -104,15 +108,19 @@ def mask_to_mesh(mask_path: Path, case: str):
           f"-> decimated {dec.n_points} pts, {dec.n_cells} tris  | vol={vol_ml:.1f} mL")
 
 if __name__ == "__main__":
+    import sys
+    cases_filter = set(sys.argv[1:])   # optional: pass case stems to re-mesh only those
     MESH_DIR.mkdir(parents=True, exist_ok=True)
     t_total = time.perf_counter()
     for mask_path in sorted(LA_DIR.glob(GLOB)):
         if mask_path.name.endswith("_LA_seed.nii.gz"):
             continue
         case = mask_path.name.replace("_LA.nii.gz", "")
+        if cases_filter and case not in cases_filter:
+            continue
         out_vtk = MESH_DIR / f"{case}_LA.vtk"
         out_stl = MESH_DIR / f"{case}_LA.stl"
-        if SKIP_EXISTING and out_vtk.exists() and out_stl.exists():
+        if SKIP_EXISTING and not cases_filter and out_vtk.exists() and out_stl.exists():
             print(f"[{case}] mesh exists, skip")
             continue
         print(f"\n[{case}] meshing...")

@@ -175,7 +175,11 @@ def adaptive_threshold(ct, seed_mask):
     seed_arr = sitk.GetArrayFromImage(seed_mask).astype(bool)
     vals = ct_arr[seed_arr]
     p2, p98 = float(np.percentile(vals, 2)), float(np.percentile(vals, 98))
-    lo = max(120.0,  p2  - 50.0)
+    lo = max(120.0,  p2  - 100.0)   # VALIDATED default (was 50): the -50 margin left
+                                    # dimmer blood in distal PV segments uncaught (PVs
+                                    # missing on 1492/226/4735/540). -100 fills them;
+                                    # the v6 forbidden blockers (RV/PA padded) keep the
+                                    # wider window from spilling. Confirmed no leaks.
     hi = min(1500.0, p98 + 150.0)
     print(f"    seed HU: p2={p2:.0f}  p98={p98:.0f}  -> threshold [{lo:.0f}, {hi:.0f}]")
     return lo, hi
@@ -318,9 +322,13 @@ def grow_one(case):
 
 # === Entry point ===
 if __name__ == "__main__":
+    import sys
+    cases_filter = set(sys.argv[1:])   # optional: pass case stems to process only those
     t_total = time.perf_counter()
     for nii in sorted(NIFTI_DIR.glob(GLOB)):
         case = nii.name.replace(".nii.gz", "")
-        print(f"\n[{case}] region-growing v7...")
+        if cases_filter and case not in cases_filter:
+            continue
+        print(f"\n[{case}] region-growing...")
         grow_one(case)
     print(f"\n[total] {time.perf_counter() - t_total:.1f}s")
