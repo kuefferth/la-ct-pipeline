@@ -30,11 +30,10 @@ TAUBIN_ITER       = 100     # smoothing iterations; more = smoother. SAFE lever 
 TAUBIN_PASS_BAND  = 0.05    # 0.01-0.2 range; lower = stronger smoothing
 DECIMATE_FRAC     = 0.7     # 0.7 = remove 70% of triangles (keep 30%)
 GLOB              = "*_LA.nii.gz"   # final masks only; ignores *_LA_seed.nii.gz
-SKIP_EXISTING     = False   # FALSE for the full re-threshold batch: 02b overwrites every
-                            # mask (new p2-100 window), so all meshes must regenerate or
-                            # they go stale vs their mask. Flip back to True afterward for
-                            # fast incremental runs. (Passing explicit case args also forces
-                            # a re-mesh regardless of this flag.)
+SKIP_EXISTING     = True    # skip cases whose full VTK + STL already exist. Set False to
+                            # force a full re-mesh (e.g. after a global 02b threshold change
+                            # that overwrites every mask). Passing explicit case args also
+                            # forces a re-mesh regardless of this flag.
 
 # === Tiny timing helper ===
 class T:
