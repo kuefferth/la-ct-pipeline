@@ -1,5 +1,6 @@
 data/
 derivatives/
+third_party/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
