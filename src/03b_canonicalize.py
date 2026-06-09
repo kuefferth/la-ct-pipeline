@@ -12,13 +12,11 @@ Per case:
 
 Reads:
   derivatives/seg_la/<case>_LA.nii.gz
-  derivatives/meshes/<case>_LA.stl
-  derivatives/meshes/<case>_LA_decimated.stl
+  derivatives/meshes/<case>_LA.stl          (decimated; the only mesh 03 now writes)
 
 Writes:
   derivatives/canonical/<case>_LA_T.npy     (4x4 world->canonical)
   derivatives/canonical/<case>_LA_canonical.stl
-  derivatives/canonical/<case>_LA_decimated_canonical.stl
 """
 import time
 from pathlib import Path
@@ -52,7 +50,6 @@ def apply_transform_to_mesh(mesh_path: Path, T44, out_path: Path):
 def canonicalize_one(case: str):
     la_path  = LA_DIR  / f"{case}_LA.nii.gz"
     stl_path = MESH_DIR / f"{case}_LA.stl"
-    dec_path = MESH_DIR / f"{case}_LA_decimated.stl"
     if not la_path.exists() or not stl_path.exists():
         print(f"  [skip] missing inputs for {case}"); return
 
@@ -70,9 +67,6 @@ def canonicalize_one(case: str):
     np.save(OUT_DIR / f"{case}_LA_T.npy", T44)
     apply_transform_to_mesh(stl_path, T44,
                             OUT_DIR / f"{case}_LA_canonical.stl")
-    if dec_path.exists():
-        apply_transform_to_mesh(dec_path, T44,
-                                OUT_DIR / f"{case}_LA_decimated_canonical.stl")
     print(f"[{case}] centered")
 
 if __name__ == "__main__":

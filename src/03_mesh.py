@@ -5,9 +5,11 @@ that touch the CT FOV border get a closed (flat) cap instead of an open hole.
 
 Per case:
   derivatives/seg_la/<case>_LA.nii.gz  (final refined mask, NOT _LA_seed)
-    -> pad -> marching cubes -> largest CC -> Taubin smoothing
-    -> save full + decimated meshes
-    -> derivatives/meshes/<case>_LA.{vtk,stl}, <case>_LA_decimated.stl
+    -> pad -> marching cubes -> largest CC -> Taubin smoothing -> decimate
+    -> derivatives/meshes/<case>_LA.{vtk,stl}   (decimated; full-res no longer written)
+
+Decimated is the ONLY output: it is visually indistinguishable from full-res here
+and the full-res files were large. So <case>_LA.{vtk,stl} IS the decimated mesh.
 """
 import time
 from pathlib import Path
@@ -20,13 +22,13 @@ MESH_DIR = Path("derivatives/meshes")
 
 # === Tunables ===
 PAD_VOXELS        = 4       # background border added on every side; closes border-touching caps
-GAUSS_VAR         = 1.0     # mask pre-smooth variance (mm^2). Chosen on scrap set
-                            # (g10/t100 read smoothest). RAISES fusion risk: too high
-                            # re-closes the LSPV/LAA carina. 1.0 held on the 4 scrap
-                            # cases but RE-CHECK the carina on the full 41-case batch;
-                            # drop toward 0.6 if any tight carina fuses at mesh stage.
-TAUBIN_ITER       = 100     # smoothing iterations; more = smoother. SAFE lever for
-                            # extra smoothness (volume-preserving, cannot re-fuse).
+GAUSS_VAR         = 0.7     # mask pre-smooth variance (mm^2). VALIDATED g0.7_t60 on the
+                            # smooth sweep (854/540/2643): g1.0/t100 was over-smoothed vs
+                            # the crisp masks; g0.7/t60 keeps PV-ostia/carina detail. The
+                            # Gaussian blur is the detail-eater + fusion risk -- re-check
+                            # the 540 carina on the batch; drop toward 0.5 if any fuses.
+TAUBIN_ITER       = 60      # smoothing iterations; more = smoother. SAFE lever (volume-
+                            # preserving, cannot re-fuse). Lowered 100 -> 60 with GAUSS 0.7.
 TAUBIN_PASS_BAND  = 0.05    # 0.01-0.2 range; lower = stronger smoothing
 DECIMATE_FRAC     = 0.7     # 0.7 = remove 70% of triangles (keep 30%)
 GLOB              = "*_LA.nii.gz"   # final masks only; ignores *_LA_seed.nii.gz
@@ -89,22 +91,16 @@ def mask_to_mesh(mask_path: Path, case: str):
     with T("compute normals"):
         surf = surf.compute_normals(auto_orient_normals=True, consistent_normals=True)
 
-    # Save full-resolution mesh
-    with T("save VTK + STL (full)"):
-        surf.save(str(MESH_DIR / f"{case}_LA.vtk"))
-        surf.save(str(MESH_DIR / f"{case}_LA.stl"))
-
-    # Decimated copy for sharing / lightweight downstream use
+    # Decimate (target_reduction = fraction of triangles to REMOVE) and save as the
+    # single output. Full-res is no longer written; <case>_LA.{vtk,stl} IS decimated.
     with T("decimate + save"):
-        # decimate uses target_reduction = fraction of triangles to REMOVE
         dec = surf.decimate(DECIMATE_FRAC)
-        dec.save(str(MESH_DIR / f"{case}_LA_decimated.stl"))
-        dec.save(str(MESH_DIR / f"{case}_LA_decimated.vtk"))
+        dec.save(str(MESH_DIR / f"{case}_LA.vtk"))
+        dec.save(str(MESH_DIR / f"{case}_LA.stl"))
 
-    # Report
-    vol_ml = surf.volume / 1000.0   # pyvista returns mm^3; convert to mL
-    print(f"[{case}] mesh: {surf.n_points} pts, {surf.n_cells} tris  "
-          f"-> decimated {dec.n_points} pts, {dec.n_cells} tris  | vol={vol_ml:.1f} mL")
+    # Report (volume from the decimated mesh that ships)
+    vol_ml = dec.volume / 1000.0   # pyvista returns mm^3; convert to mL
+    print(f"[{case}] mesh (decimated): {dec.n_points} pts, {dec.n_cells} tris  | vol={vol_ml:.1f} mL")
 
 if __name__ == "__main__":
     import sys

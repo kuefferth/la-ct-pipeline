@@ -175,11 +175,12 @@ def adaptive_threshold(ct, seed_mask):
     seed_arr = sitk.GetArrayFromImage(seed_mask).astype(bool)
     vals = ct_arr[seed_arr]
     p2, p98 = float(np.percentile(vals, 2)), float(np.percentile(vals, 98))
-    lo = max(120.0,  p2  - 100.0)   # VALIDATED default (was 50): the -50 margin left
-                                    # dimmer blood in distal PV segments uncaught (PVs
-                                    # missing on 1492/226/4735/540). -100 fills them;
-                                    # the v6 forbidden blockers (RV/PA padded) keep the
-                                    # wider window from spilling. Confirmed no leaks.
+    lo = max(120.0,  p2  - 130.0)   # VALIDATED default (was 50, then 100): widened in
+                                    # steps to reach dimmer blood in distal PV segments
+                                    # (PVs still a tad short at -100). v6 forbidden blockers
+                                    # (RV/PA padded) keep the wider window from spilling.
+                                    # Floor stays 120 HU; if darker PVs persist (legacy
+                                    # cases clamp at the floor), lower the floor next.
     hi = min(1500.0, p98 + 150.0)
     print(f"    seed HU: p2={p2:.0f}  p98={p98:.0f}  -> threshold [{lo:.0f}, {hi:.0f}]")
     return lo, hi
