@@ -37,6 +37,7 @@ from stage1_1_remesh import remesh_main
 from stage1_2_separate_atria import separate_atria_main
 from stage1_3_clip_valves import clip_valves_main
 from stage2_annotate_orifices import annotate_orifices_main
+from stage1_4_compute_sdf_and_place_seeds import compute_sdf_and_place_seeds_main as native_seed_main
 import stage1_5_clip_veins
 import stage3_divide_atria
 
@@ -61,6 +62,13 @@ SEED_DIAM_MM     = 6     # seed each region where its diameter is ~this (proxima
                          # not at the narrow distal tip.
 MIN_REGION_PTS   = 80    # drop thin specks smaller than a real ostium
 SDF_CHUNK        = 2000
+MANUAL_SEEDS     = False  # True (--manual) = use DIVAID's native interactive seed picker for
+                          # PV/LAA instead of the SDF auto-seeder (MV is still auto from the
+                          # open mesh; review_clip + result viewer stay patched off). Used to
+                          # build the ground-truth training set. Seeds saved to ..._LA_seeds.txt.
+SEEDS_ONLY       = False  # True (--seeds-only) = stop right after seeding (skip clip/annotate/
+                          # divide). For fast ground-truth collection: place seeds -> saved ->
+                          # next case, no downstream stage-3 crashes to derail the seeding pass.
 DROP_MPV         = True   # ignore DIVAID's spurious 'middle-PV' orifices. Its vein clip
                           # fragments our remeshed surface into ~180 pinholes, each annotated
                           # as an MPV; stage 3 ingests every MPV and crashes. The 6 CORE
@@ -137,10 +145,24 @@ def auto_sdf_and_seeds_main(args, pipeline=True):
               f"(split<{split_thr}mm, seed@~{SEED_DIAM_MM}mm) -> ids {list(seed_ids)}")
 
 
+def resolve_case(case):
+    """Accept a full stem or a short case id (the token before '_0___')."""
+    pr = REPO / "derivatives" / "parcellation"
+    if (pr / case / f"{case}_LA_open.vtk").exists():
+        return case
+    cand = [d.name for d in pr.glob(f"{case}_0___*") if (d / f"{d.name}_LA_open.vtk").exists()]
+    if len(cand) == 1:
+        return cand[0]
+    return None
+
+
 def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, I->S)
+    stem = resolve_case(case)
+    if stem is None:
+        print(f"[{case}] no open mesh found (run 04a, or give the full stem)")
+        return f"skip: no open mesh for '{case}'"
+    case = stem
     open_mesh = REPO / "derivatives" / "parcellation" / case / f"{case}_LA_open"
-    if not open_mesh.with_suffix(".vtk").exists():
-        print(f"[{case}] missing {open_mesh}.vtk -- run 04a_divaid_prep.py first"); return
 
     args = Namespace(
         mesh=str(open_mesh), atrium=atrium,
@@ -167,12 +189,25 @@ def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, 
             print("WARN: SDF cache point count != remeshed mesh -> ignoring cache (re-running fresh)")
             reuse = False
 
-    print(f"\n=== [{case}] DIVAID (auto{', reuse cache' if reuse else ''}) ===")
+    mode = "manual seeds" if MANUAL_SEEDS else "auto seeds"
+    if SEEDS_ONLY:
+        mode += ", seeds-only"
+    print(f"\n=== [{case}] DIVAID ({mode}{', reuse cache' if reuse else ''}) ===")
     if not reuse:
         remesh_main(args)                                # 1.1
         separate_atria_main(args, True)                  # 1.2
         clip_valves_main(args, True)                     # 1.3 (MV auto from open mesh)
-    auto_sdf_and_seeds_main(args, True)                  # 1.4 (auto seeds, replaces picking)
+    if MANUAL_SEEDS:
+        native_seed_main(args, True)                     # 1.4 DIVAID interactive PV/LAA picker
+    else:
+        auto_sdf_and_seeds_main(args, True)              # 1.4 auto seeds (replaces picking)
+
+    if SEEDS_ONLY:                                       # stop after capturing seeds
+        seeds_txt = (Path(f"{args.mesh}_division") / "stage1_preprocessing"
+                     / f"{Path(args.mesh).stem}_{atrium}_seeds.txt")
+        print(f"[{case}] seeds captured -> {seeds_txt}")
+        return "seeds-only"
+
     stage1_5_clip_veins.clip_veins_main(args, True)      # 1.5 (review patched off)
     annotate_orifices_main(args, True)                   # 2
     if DROP_MPV:
@@ -185,18 +220,23 @@ def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, 
 
     out = Path(f"{args.mesh}_division") / "stage3_division" / f"{Path(args.mesh).stem}_{atrium}_division.vtk"
     print(f"\n[{case}] DONE -> {out}  (exists={out.exists()})")
+    return "ok" if out.exists() else "FAIL: no division written"
 
 
 if __name__ == "__main__":
     import traceback
-    cases = sys.argv[1:]
+    argv = sys.argv[1:]
+    if "--manual" in argv:                 # native DIVAID picker for PV/LAA seeds
+        MANUAL_SEEDS = True
+    if "--seeds-only" in argv:             # stop after seeding (no clip/annotate/divide)
+        SEEDS_ONLY = True
+    cases = [a for a in argv if not a.startswith("--")]
     if not cases:
-        print("usage: python src/04_parcellate.py <case> [<case> ...]"); sys.exit(1)
+        print("usage: python src/04_parcellate.py [--manual] [--seeds-only] <case> ..."); sys.exit(1)
     results = {}
     for c in cases:
         try:
-            run_case(c)
-            results[c] = "ok"
+            results[c] = run_case(c) or "ok"
         except Exception as e:                         # one bad case must not abort the batch
             traceback.print_exc()
             results[c] = f"FAIL: {type(e).__name__}: {e}"
