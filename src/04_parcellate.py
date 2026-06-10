@@ -50,9 +50,13 @@ from utils import (add_array_to_mesh, create_directories, get_connected_regions,
 # at 25 mm adjacent ostia merge across the wide carina (on case 121 LSPV fused into the LAA
 # region -> LSPV missed). We separate at a tighter diameter so each ostium is its own thin
 # region, then seed each at a proximal ~6 mm point (Thomas QC: distal tips are too narrow).
-SEPARATE_DIAM_MM = 12    # threshold (mm) for splitting ostia into distinct regions. 12 cut
-                         # the LSPV/LAA carina and dropped the CS-ostium dimple (>12 mm =
-                         # body) on case 121. Lower = more separation but more fragments.
+SEPARATE_DIAM_LADDER = [12, 15, 18, 22]  # threshold (mm) for splitting ostia into distinct
+                         # regions, tried in order and LOOSENED only if too few ostia resolve.
+                         # 12 is right for high-res pcct (cuts the LSPV/LAA carina, drops the
+                         # CS dimple). Low-res legacy meshes have wider PVs, so fewer cross a
+                         # tight threshold (case 1161: 2 at 12mm); loosening finds more.
+TARGET_MIN_VEINS = 3     # DIVAID's L/R superior/inferior split needs >=3 veins (case 114
+                         # passed with 3, 1161 crashed with 2). Stop loosening once reached.
 SEED_DIAM_MM     = 6     # seed each region where its diameter is ~this (proximal trunk),
                          # not at the narrow distal tip.
 MIN_REGION_PTS   = 80    # drop thin specks smaller than a real ostium
@@ -72,14 +76,10 @@ REUSE_SDF       = False                   # DANGER: DIVAID's remesh is NON-DETER
                                           # run_case also refuses a stale cache if this is on.
 
 
-def auto_seed_ids(mesh, sdf_values, atrium):
-    """One seed point-id per vein. Split ostia apart at SEPARATE_DIAM_MM (so the
-    LSPV/LAA carina is cut and each ostium is its own thin region), then seed each
-    region where its diameter is closest to SEED_DIAM_MM (the proximal trunk, not
-    the narrow tip). 'Ids' are positional indices (vtkIdFilter), so a region's Id
-    IS the seed index expected downstream."""
-    m = add_array_to_mesh(mesh, sdf_values, "sdf")
-    thin = threshold_filter(m, "sdf", 0, SEPARATE_DIAM_MM)
+def _seeds_at(m, thr):
+    """Seed ids for one split diameter: one per thin region, at its ~SEED_DIAM_MM
+    (proximal trunk) point. 'Ids' are positional indices (vtkIdFilter)."""
+    thin = threshold_filter(m, "sdf", 0, thr)
     seeds = []
     for reg in get_connected_regions(thin):
         if reg.GetNumberOfPoints() < MIN_REGION_PTS:
@@ -88,7 +88,22 @@ def auto_seed_ids(mesh, sdf_values, atrium):
         reg_ids = vtk_to_numpy(reg.GetPointData().GetArray("Ids"))
         j = int(np.argmin(np.abs(reg_sdf - SEED_DIAM_MM)))   # ~6 mm proximal trunk
         seeds.append(int(reg_ids[j]))
-    return np.array(sorted(seeds), dtype=int)
+    return sorted(seeds)
+
+
+def auto_seed_ids(mesh, sdf_values, atrium):
+    """One seed per vein. Split ostia apart at the tightest ladder diameter that
+    resolves >=TARGET_MIN_VEINS (so the LSPV/LAA carina stays cut on pcct but
+    low-res legacy meshes loosen until enough PVs separate). Returns (ids, thr)."""
+    m = add_array_to_mesh(mesh, sdf_values, "sdf")
+    best, best_thr = [], SEPARATE_DIAM_LADDER[0]
+    for thr in SEPARATE_DIAM_LADDER:
+        s = _seeds_at(m, thr)
+        if len(s) > len(best):
+            best, best_thr = s, thr
+        if len(s) >= TARGET_MIN_VEINS:
+            return np.array(s, dtype=int), thr
+    return np.array(best, dtype=int), best_thr   # best effort if none reach the target
 
 
 def auto_sdf_and_seeds_main(args, pipeline=True):
@@ -116,10 +131,10 @@ def auto_sdf_and_seeds_main(args, pipeline=True):
             sdf_mesh = add_array_to_mesh(sdf_mesh, sdf_inter, "sdf_intersection_ids")
             write_vtk(sdf_mesh, sdf_vtk)
 
-        seed_ids = auto_seed_ids(mesh, sdf_values, atrium)
+        seed_ids, split_thr = auto_seed_ids(mesh, sdf_values, atrium)
         write_ids(seed_ids, sdf_dir / f"{mesh_name}_{atrium}_seeds.txt")
         print(f"AUTO-SEEDS [{atrium}]: {len(seed_ids)} veins "
-              f"(split<{SEPARATE_DIAM_MM}mm, seed@~{SEED_DIAM_MM}mm) -> ids {list(seed_ids)}")
+              f"(split<{split_thr}mm, seed@~{SEED_DIAM_MM}mm) -> ids {list(seed_ids)}")
 
 
 def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, I->S)
@@ -173,8 +188,20 @@ def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, 
 
 
 if __name__ == "__main__":
+    import traceback
     cases = sys.argv[1:]
     if not cases:
         print("usage: python src/04_parcellate.py <case> [<case> ...]"); sys.exit(1)
+    results = {}
     for c in cases:
-        run_case(c)
+        try:
+            run_case(c)
+            results[c] = "ok"
+        except Exception as e:                         # one bad case must not abort the batch
+            traceback.print_exc()
+            results[c] = f"FAIL: {type(e).__name__}: {e}"
+    print("\n=== BATCH SUMMARY ===")
+    for c, r in results.items():
+        print(f"  {c}: {r}")
+    if any(r != "ok" for r in results.values()):
+        sys.exit(1)
