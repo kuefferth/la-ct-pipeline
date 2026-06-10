@@ -161,6 +161,20 @@ def resolve_case(case):
     return None
 
 
+def seeds_path(case):
+    return (REPO / "derivatives" / "parcellation" / case / f"{case}_LA_open_division"
+            / "stage1_preprocessing" / f"{case}_LA_open_LA_seeds.txt")
+
+
+def all_cases(unseeded_only=False):
+    """Every case with an open mesh, name-sorted; optionally only those not yet seeded."""
+    pr = REPO / "derivatives" / "parcellation"
+    cases = sorted(m.parent.name for m in pr.glob("*/*_LA_open.vtk"))
+    if unseeded_only:
+        cases = [c for c in cases if not seeds_path(c).exists()]
+    return cases
+
+
 def manual_pick_seeds(mesh, atrium="LA"):
     """Front-surface seed picker, replacing DIVAID's interactively_select_seeds.
     DIVAID's enable_point_picking grabs the nearest vertex along the whole ray, so
@@ -274,7 +288,13 @@ if __name__ == "__main__":
         RESUME = True
     cases = [a for a in argv if not a.startswith("--")]
     if not cases:
-        print("usage: python src/04_parcellate.py [--manual] [--seeds-only] <case> ..."); sys.exit(1)
+        # no cases listed: walk the whole folder (name-ordered). For a manual seeding
+        # pass, skip cases already seeded so you can stop/resume the campaign freely.
+        cases = all_cases(unseeded_only=MANUAL_SEEDS)
+        if not cases:
+            print("nothing to do (no open meshes, or all already seeded)"); sys.exit(0)
+        print(f"processing {len(cases)} case(s) from the folder"
+              f"{' (unseeded only)' if MANUAL_SEEDS else ''}")
     results = {}
     for n, c in enumerate(cases):
         try:
