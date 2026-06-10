@@ -37,6 +37,7 @@ from stage1_1_remesh import remesh_main
 from stage1_2_separate_atria import separate_atria_main
 from stage1_3_clip_valves import clip_valves_main
 from stage2_annotate_orifices import annotate_orifices_main
+import stage1_4_compute_sdf_and_place_seeds as stage1_4
 from stage1_4_compute_sdf_and_place_seeds import compute_sdf_and_place_seeds_main as native_seed_main
 import stage1_5_clip_veins
 import stage3_divide_atria
@@ -69,6 +70,10 @@ MANUAL_SEEDS     = False  # True (--manual) = use DIVAID's native interactive se
 SEEDS_ONLY       = False  # True (--seeds-only) = stop right after seeding (skip clip/annotate/
                           # divide). For fast ground-truth collection: place seeds -> saved ->
                           # next case, no downstream stage-3 crashes to derail the seeding pass.
+RESUME           = False  # True (--resume) = skip stages 1.1-1.4 and reuse the remeshed/clipped/
+                          # sdf/seeds already on disk from a prior (e.g. --seeds-only) run, then
+                          # clip veins -> annotate -> divide. Turns captured manual seeds into
+                          # full divisions without re-remeshing (which would break id alignment).
 DROP_MPV         = True   # ignore DIVAID's spurious 'middle-PV' orifices. Its vein clip
                           # fragments our remeshed surface into ~180 pinholes, each annotated
                           # as an MPV; stage 3 ingests every MPV and crashes. The 6 CORE
@@ -156,6 +161,39 @@ def resolve_case(case):
     return None
 
 
+def manual_pick_seeds(mesh, atrium="LA"):
+    """Front-surface seed picker, replacing DIVAID's interactively_select_seeds.
+    DIVAID's enable_point_picking grabs the nearest vertex along the whole ray, so
+    it ignores occlusion and picks the BACK wall on curved geometry. We pick on the
+    visible surface (first front-face hit) and snap that to the nearest vertex, so a
+    click lands where you clicked. Returns positional seed ids (same as the native)."""
+    import pyvista as pv
+    from scipy.spatial import cKDTree
+    all_points = vtk_to_numpy(mesh.GetPoints().GetData())
+    tree = cKDTree(all_points)
+    seeds, actors = [], []
+
+    p = pv.Plotter(window_size=[1600, 1000], notebook=False)
+    p.add_mesh(pv.wrap(mesh), color="#CCCCCC", show_edges=False, pickable=True)
+    p.add_text(f"[{atrium}] click each PV/LAA ostium (front surface only).\n"
+               f"u = undo last,   q / close window = done", font_size=12)
+
+    def cb(point):
+        sid = int(tree.query(point)[1])               # snap surface point -> nearest vertex
+        seeds.append(sid)
+        actors.append(p.add_mesh(pv.Sphere(radius=2.0, center=all_points[sid]),
+                                 color="red", pickable=False))
+
+    def undo():
+        if seeds:
+            seeds.pop(); p.remove_actor(actors.pop())
+
+    p.enable_surface_point_picking(callback=cb, show_message=False, show_point=False)
+    p.add_key_event("u", undo)
+    p.show()
+    return seeds
+
+
 def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, I->S)
     stem = resolve_case(case)
     if stem is None:
@@ -176,6 +214,8 @@ def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, 
     # neutralize the two interactive windows (keep third_party pristine)
     stage1_5_clip_veins.review_clip = lambda mesh, clipped_mesh, veins: veins
     stage3_divide_atria.plot_divided_mesh = lambda *a, **k: None
+    if MANUAL_SEEDS:                     # front-surface picker (no backside snapping)
+        stage1_4.interactively_select_seeds = manual_pick_seeds
 
     s1 = Path(f"{args.mesh}_division") / "stage1_preprocessing"
     stem = Path(args.mesh).stem
@@ -189,24 +229,24 @@ def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, 
             print("WARN: SDF cache point count != remeshed mesh -> ignoring cache (re-running fresh)")
             reuse = False
 
-    mode = "manual seeds" if MANUAL_SEEDS else "auto seeds"
+    mode = "resume" if RESUME else ("manual seeds" if MANUAL_SEEDS else "auto seeds")
     if SEEDS_ONLY:
         mode += ", seeds-only"
     print(f"\n=== [{case}] DIVAID ({mode}{', reuse cache' if reuse else ''}) ===")
-    if not reuse:
-        remesh_main(args)                                # 1.1
-        separate_atria_main(args, True)                  # 1.2
-        clip_valves_main(args, True)                     # 1.3 (MV auto from open mesh)
-    if MANUAL_SEEDS:
-        native_seed_main(args, True)                     # 1.4 DIVAID interactive PV/LAA picker
-    else:
-        auto_sdf_and_seeds_main(args, True)              # 1.4 auto seeds (replaces picking)
-
-    if SEEDS_ONLY:                                       # stop after capturing seeds
-        seeds_txt = (Path(f"{args.mesh}_division") / "stage1_preprocessing"
-                     / f"{Path(args.mesh).stem}_{atrium}_seeds.txt")
-        print(f"[{case}] seeds captured -> {seeds_txt}")
-        return "seeds-only"
+    if not RESUME:
+        if not reuse:
+            remesh_main(args)                            # 1.1
+            separate_atria_main(args, True)              # 1.2
+            clip_valves_main(args, True)                 # 1.3 (MV auto from open mesh)
+        if MANUAL_SEEDS:
+            native_seed_main(args, True)                 # 1.4 DIVAID interactive PV/LAA picker
+        else:
+            auto_sdf_and_seeds_main(args, True)          # 1.4 auto seeds (replaces picking)
+        if SEEDS_ONLY:                                   # stop after capturing seeds
+            seeds_txt = (Path(f"{args.mesh}_division") / "stage1_preprocessing"
+                         / f"{Path(args.mesh).stem}_{atrium}_seeds.txt")
+            print(f"[{case}] seeds captured -> {seeds_txt}")
+            return "seeds-only"
 
     stage1_5_clip_veins.clip_veins_main(args, True)      # 1.5 (review patched off)
     annotate_orifices_main(args, True)                   # 2
@@ -230,16 +270,21 @@ if __name__ == "__main__":
         MANUAL_SEEDS = True
     if "--seeds-only" in argv:             # stop after seeding (no clip/annotate/divide)
         SEEDS_ONLY = True
+    if "--resume" in argv:                 # reuse prior seeds/intermediates -> divide
+        RESUME = True
     cases = [a for a in argv if not a.startswith("--")]
     if not cases:
         print("usage: python src/04_parcellate.py [--manual] [--seeds-only] <case> ..."); sys.exit(1)
     results = {}
-    for c in cases:
+    for n, c in enumerate(cases):
         try:
             results[c] = run_case(c) or "ok"
         except Exception as e:                         # one bad case must not abort the batch
             traceback.print_exc()
             results[c] = f"FAIL: {type(e).__name__}: {e}"
+        if MANUAL_SEEDS and n < len(cases) - 1:         # pace manual seeding case-by-case
+            if input(f"\n--- next case ({len(cases)-n-1} left)? [Enter=yes, n=stop] ").strip().lower() == "n":
+                break
     print("\n=== BATCH SUMMARY ===")
     for c, r in results.items():
         print(f"  {c}: {r}")
