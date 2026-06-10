@@ -221,6 +221,30 @@ def quick_manual_seeds(args, atrium):
     print(f"  {len(seed_ids)} seeds captured (SDF deferred)")
 
 
+def ensure_manifold(args):
+    """Repair non-manifold edges in the open mesh (some 04a mitral clips leave one),
+    keeping the MV hole open, so DIVAID's remesh (meshing_close_holes requires edge
+    manifoldness) doesn't fail. Runs in the divaid env, which has pymeshlab."""
+    import pymeshlab
+    import pyvista as pv
+    p = f"{args.mesh}.vtk"
+    m = pv.read(p).triangulate()
+    nm = m.extract_feature_edges(boundary_edges=False, feature_edges=False,
+                                 manifold_edges=False, non_manifold_edges=True)
+    if nm.n_cells == 0:
+        return
+    print(f"  repairing {nm.n_cells} non-manifold edge(s) in open mesh (keeping MV hole)...")
+    verts = np.asarray(m.points, np.float64)
+    faces = m.faces.reshape(-1, 4)[:, 1:].astype(np.int32)
+    ms = pymeshlab.MeshSet()
+    ms.add_mesh(pymeshlab.Mesh(vertex_matrix=verts, face_matrix=faces))
+    ms.apply_filter("meshing_repair_non_manifold_edges")
+    f2 = ms.current_mesh().face_matrix()
+    out = pv.PolyData(ms.current_mesh().vertex_matrix(),
+                      np.hstack([np.full((len(f2), 1), 3), f2]).astype(np.int64).ravel())
+    out.save(p)
+
+
 def ensure_sdf(args, atrium):
     """Compute + write the SDF mesh if it's missing (seeds-only skips it)."""
     s1 = Path(f"{args.mesh}_division") / "stage1_preprocessing"
@@ -278,6 +302,7 @@ def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, 
     print(f"\n=== [{case}] DIVAID ({mode}{', reuse cache' if reuse else ''}) ===")
     if not RESUME:
         if not reuse:
+            ensure_manifold(args)                        # fix non-manifold edges from the clip
             remesh_main(args)                            # 1.1
             separate_atria_main(args, True)              # 1.2
             clip_valves_main(args, True)                 # 1.3 (MV auto from open mesh)
@@ -338,5 +363,5 @@ if __name__ == "__main__":
     print("\n=== BATCH SUMMARY ===")
     for c, r in results.items():
         print(f"  {c}: {r}")
-    if any(r != "ok" for r in results.values()):
+    if any(r.startswith(("FAIL", "skip")) for r in results.values()):
         sys.exit(1)
