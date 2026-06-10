@@ -115,6 +115,10 @@ def prep_one(case):
         origin, normal = plane
         open_mesh = open_mesh_at_plane(mesh, origin, normal, la_c)
 
+    # strip the junk arrays pyvista's clip/extract_surface adds (vtkOriginal* Ids):
+    # DIVAID re-derives Ids/Normals/SDF itself, and transferring this array onto the
+    # remeshed mesh just NaNs the mitral-fill points -> the "no scalar value" warning.
+    open_mesh.clear_data()
     open_path = out_dir / f"{case}_LA_open.vtk"
     open_mesh.save(str(open_path))
     n_edges = open_mesh.extract_feature_edges(
