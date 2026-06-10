@@ -208,6 +208,35 @@ def manual_pick_seeds(mesh, atrium="LA"):
     return seeds
 
 
+def quick_manual_seeds(args, atrium):
+    """Seeds-only manual capture: just the front-surface picker on the remeshed mesh,
+    NO SDF. DIVAID's native seeder computes the (slow) SDF alongside the picker and
+    blocks on it after you close the window -- pointless in seeds-only, where we stop
+    before vein clipping. The SDF is computed later by ensure_sdf() at --resume time."""
+    s1 = Path(f"{args.mesh}_division") / "stage1_preprocessing"
+    stem = Path(args.mesh).stem
+    mesh = read_vtk(s1 / f"{stem}_remeshed_{atrium}.vtk")
+    seed_ids = manual_pick_seeds(mesh, atrium)
+    write_ids(seed_ids, s1 / f"{stem}_{atrium}_seeds.txt")
+    print(f"  {len(seed_ids)} seeds captured (SDF deferred)")
+
+
+def ensure_sdf(args, atrium):
+    """Compute + write the SDF mesh if it's missing (seeds-only skips it)."""
+    s1 = Path(f"{args.mesh}_division") / "stage1_preprocessing"
+    stem = Path(args.mesh).stem
+    sdf_vtk = s1 / f"{stem}_remeshed_{atrium}_sdf.vtk"
+    if sdf_vtk.exists():
+        return
+    print("  computing SDF (was deferred during seeds-only)...")
+    mesh = read_vtk(s1 / f"{stem}_remeshed_{atrium}.vtk")
+    pts, faces, normals = get_points_faces_normals(mesh)
+    sdf, inter = get_sdf_main(pts, faces, normals, SDF_CHUNK)
+    sdf_mesh = add_array_to_mesh(mesh, sdf, "sdf")
+    sdf_mesh = add_array_to_mesh(sdf_mesh, inter, "sdf_intersection_ids")
+    write_vtk(sdf_mesh, sdf_vtk)
+
+
 def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, I->S)
     stem = resolve_case(case)
     if stem is None:
@@ -252,16 +281,17 @@ def run_case(case, atrium="LA", cos="x,z"):   # x,z = our LPS body frame (R->L, 
             remesh_main(args)                            # 1.1
             separate_atria_main(args, True)              # 1.2
             clip_valves_main(args, True)                 # 1.3 (MV auto from open mesh)
-        if MANUAL_SEEDS:
-            native_seed_main(args, True)                 # 1.4 DIVAID interactive PV/LAA picker
+        if MANUAL_SEEDS and SEEDS_ONLY:
+            quick_manual_seeds(args, atrium)             # picker only; SDF deferred to --resume
+        elif MANUAL_SEEDS:
+            native_seed_main(args, True)                 # 1.4 picker + SDF (full pipeline needs SDF)
         else:
             auto_sdf_and_seeds_main(args, True)          # 1.4 auto seeds (replaces picking)
         if SEEDS_ONLY:                                   # stop after capturing seeds
-            seeds_txt = (Path(f"{args.mesh}_division") / "stage1_preprocessing"
-                         / f"{Path(args.mesh).stem}_{atrium}_seeds.txt")
-            print(f"[{case}] seeds captured -> {seeds_txt}")
+            print(f"[{case}] seeds captured -> {s1 / f'{stem}_{atrium}_seeds.txt'}")
             return "seeds-only"
 
+    ensure_sdf(args, atrium)                             # compute SDF now if seeds-only skipped it
     stage1_5_clip_veins.clip_veins_main(args, True)      # 1.5 (review patched off)
     annotate_orifices_main(args, True)                   # 2
     if DROP_MPV:
