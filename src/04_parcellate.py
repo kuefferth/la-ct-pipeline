@@ -341,6 +341,8 @@ if __name__ == "__main__":
         SEEDS_ONLY = True
     if "--resume" in argv:                 # reuse prior seeds/intermediates -> divide
         RESUME = True
+    if "--keep-mpv" in argv:               # don't drop middle-PV orifices (test)
+        DROP_MPV = False
     cases = [a for a in argv if not a.startswith("--")]
     if not cases:
         # no cases listed: walk the whole folder (name-ordered). For a manual seeding
