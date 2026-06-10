@@ -68,13 +68,21 @@ def canonicalize_one(case: str):
     apply_transform_to_mesh(stl_path, T44,
                             OUT_DIR / f"{case}_LA_canonical.stl")
     print(f"[{case}] centered")
+    return la_c
 
 if __name__ == "__main__":
+    import sys
+    # NOTE: canonical/ is DERIVED from the meshes -- it goes stale after any
+    # re-mesh (03). Re-run this (whole cohort, or pass the changed case stems) so
+    # the .npy transform + canonical STL stay in sync with the current mesh.
+    cases_filter = set(sys.argv[1:])   # optional: pass case stems to recenter only those
     t_total = time.perf_counter()
     for mask_path in sorted(LA_DIR.glob(GLOB)):
         if mask_path.name.endswith("_LA_seed.nii.gz"):
             continue
         case = mask_path.name.replace("_LA.nii.gz", "")
+        if cases_filter and case not in cases_filter:
+            continue
         print(f"\n[{case}] centering...")
         canonicalize_one(case)
     print(f"\n[total] {time.perf_counter() - t_total:.1f}s")

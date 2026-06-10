@@ -63,9 +63,38 @@ FORBIDDEN = {
 
 # === Tunables ===
 ERODE_MM             = 5.0   # seed erosion before sampling intensities + growing
-MAX_GEODESIC_MM      = 55.0  # in-mask path-distance cap from seed centroid.
+MAX_GEODESIC_MM      = 55.0  # FIXED in-mask path-distance cap from seed centroid.
                              # Tightened 60 -> 55 post-tuning to trim PVs a touch
-                             # shorter. Geodesic >= Euclidean.
+                             # shorter. Geodesic >= Euclidean. Used when ADAPTIVE_CAP
+                             # is False (validated default).
+
+# --- Adaptive geodesic cap (scale the PV cutoff to LA size) -------------------
+# The fixed cap does two jobs at once: cover the LA body (centroid -> far body
+# wall, which scales with atrium size) AND keep a PV collar past the ostium.
+# Adaptive splits it: measure the body extent geodesically, then add a collar
+# that itself SCALES with body size (bigger atria keep a slightly longer collar):
+#   body_extent = P{CAP_PCTILE} of the geodesic arrival field restricted to the
+#                 TotalSeg LA body (label 2, ~no PV) -> "how far the body wall runs".
+#                 P90 ~= 0.96 * true wall for a solid body, and is robust to the PV
+#                 stub TotalSeg includes in its LA label (P100 would chase the vein).
+#   collar      = PV_KEEP_MM + PV_KEEP_SLOPE * (body_extent - BODY_REF_MM)
+#   cap         = clamp(body_extent + collar, CAP_MIN_MM, CAP_MAX_MM)
+# Tuned on a small/mid/large scrap set (body 24/32/38mm): collar 14/18/21mm ->
+# cap 38/50/59mm. SLOPE=0.5 came from fitting small->14, mid->18; hinge at the
+# typical body size so PV_KEEP_MM is just "the collar on a normal atrium".
+# IMPORTANT: to keep LESS vein, lower BOTH PV_KEEP_MM and CAP_MIN_MM. The floor
+# (was 45) silently pins the cap on small/mid atria; 26 still catches a degenerate
+# seed (real body walls are >= ~25mm) without forcing vein onto a small LA.
+ADAPTIVE_CAP         = True   # True = derive the cap per case (see above).
+                              # False = fixed MAX_GEODESIC_MM (old validated default).
+CAP_PCTILE           = 90.0   # percentile of the in-body geodesic field = body extent.
+                              # P90 not max: guards against a stray ostial spur.
+PV_KEEP_MM           = 18.0   # PV collar (mm) at the reference body size BODY_REF_MM.
+PV_KEEP_SLOPE        = 0.5    # collar grows this many mm per mm of body beyond ref.
+BODY_REF_MM          = 32.0   # reference (typical) body extent; collar = PV_KEEP_MM here.
+CAP_MIN_MM           = 26.0   # safety floor: a degenerate/tiny seed can't collapse the
+                              # cap into the body. Keep < (smallest real body + collar).
+CAP_MAX_MM           = 70.0   # safety ceiling: a leaky body can't blow it open.
 OPEN_RADIUS_MM       = 2.0   # opening kernel radius. VALIDATED = 2.0 on the 2 legacy
                              # + 2 pcct scrap set, paired with CLOSE_MM=0: the carina
                              # held (the old recon2 fusion was the CLOSING, not the
@@ -206,15 +235,34 @@ def build_forbidden(seg):
     return forbidden, counts
 
 # === Geodesic distance-from-centroid cap (cuts distal PVs along the tube) ===
-def geodesic_centroid_cap(mask, seed, max_dist_mm):
-    """Cap mask to voxels within max_dist_mm GEODESIC (in-mask path) distance of
-    the LA seed centroid. Distance travels up the PV tubes instead of slicing a
-    sphere, so body voxels stay ~0 and PV voxels grow with how far they run up
-    the tube. Components not reachable from the seed are dropped (CC filter)."""
+def derive_adaptive_cap(arrival, body_arr):
+    """Scale the cap to LA size. body_extent = P{CAP_PCTILE} of the geodesic
+    arrival field restricted to the TotalSeg LA body (no PV); the PV collar grows
+    with body size; cap = body_extent + collar, clamped. Returns
+    (cap_mm, body_extent_mm, collar_mm)."""
+    bvals = arrival[body_arr > 0]
+    bvals = bvals[bvals < 1e6]          # drop FastMarching's unreached sentinel
+    if bvals.size == 0:                 # body not reached (bad grow) -> fall back
+        return MAX_GEODESIC_MM, float("nan"), float("nan")
+    body_extent = float(np.percentile(bvals, CAP_PCTILE))
+    collar = PV_KEEP_MM + PV_KEEP_SLOPE * (body_extent - BODY_REF_MM)
+    cap = min(CAP_MAX_MM, max(CAP_MIN_MM, body_extent + collar))
+    return cap, body_extent, collar
+
+
+def geodesic_centroid_cap(mask, seed, body=None):
+    """Cap mask to voxels within a GEODESIC (in-mask path) distance of the LA seed
+    centroid. Distance travels up the PV tubes instead of slicing a sphere, so
+    body voxels stay ~0 and PV voxels grow with how far they run up the tube.
+    Components not reachable from the seed are dropped (CC filter).
+
+    Cap distance: fixed MAX_GEODESIC_MM, or derived per case from `body` (the
+    TotalSeg LA body mask) when ADAPTIVE_CAP. Returns (capped_mask, info) where
+    info = {cap_mm, body_extent_mm}."""
     arr = sitk.GetArrayFromImage(seed)
     zs, ys, xs = np.where(arr > 0)
     if len(zs) == 0:
-        return mask
+        return mask, {"cap_mm": float("nan"), "body_extent_mm": float("nan")}
 
     # Centroid, then snap to the nearest ACTUAL seed voxel so the trial point is
     # guaranteed inside the mask (speed=1) even if the body is non-convex and the
@@ -227,18 +275,29 @@ def geodesic_centroid_cap(mask, seed, max_dist_mm):
 
     # Speed = 1 inside mask, 0 outside. With speed 0 the front cannot leave the
     # mask, so FastMarching arrival time IS the in-mask geodesic distance.
-    # FastMarching is spacing-aware, so arrival is in mm.
+    # FastMarching is spacing-aware, so arrival is in mm. March far enough to
+    # cover the largest possible cap (CAP_MAX_MM when adaptive; cap is unknown
+    # until the body is measured).
+    march_to = CAP_MAX_MM if ADAPTIVE_CAP else MAX_GEODESIC_MM
     speed = sitk.Cast(mask, sitk.sitkFloat32)
     fm = sitk.FastMarchingImageFilter()
     fm.AddTrialPoint(seed_idx)
-    fm.SetStoppingValue(max_dist_mm * 1.5)   # stop marching past the cap, for speed
+    fm.SetStoppingValue(march_to * 1.5)   # stop marching past the cap, for speed
     arrival = sitk.GetArrayFromImage(fm.Execute(speed))
 
+    if ADAPTIVE_CAP and body is not None:
+        cap_mm, body_extent, collar = derive_adaptive_cap(arrival, sitk.GetArrayFromImage(body))
+        print(f"    adaptive cap: body P{CAP_PCTILE:.0f}={body_extent:.1f}mm, "
+              f"size-scaled collar={collar:.1f}mm -> cap {cap_mm:.1f}mm "
+              f"(clamp [{CAP_MIN_MM:.0f},{CAP_MAX_MM:.0f}])")
+    else:
+        cap_mm, body_extent = MAX_GEODESIC_MM, float("nan")
+
     # Unreached / far voxels hold FastMarching's large default value -> dropped.
-    keep = (arrival <= max_dist_mm).astype(np.uint8)
+    keep = (arrival <= cap_mm).astype(np.uint8)
     keep_img = sitk.GetImageFromArray(keep)
     keep_img.CopyInformation(mask)
-    return sitk.And(mask, keep_img)
+    return sitk.And(mask, keep_img), {"cap_mm": cap_mm, "body_extent_mm": body_extent}
 
 # === Per-case pipeline ===
 def grow_one(case):
@@ -290,10 +349,11 @@ def grow_one(case):
     print(f"  after forbidden-block + largest CC: "
           f"{int(sitk.GetArrayFromImage(grown).sum())} voxels")
 
-    # 6) Geodesic distance cap (cuts distal PVs along the tube; drops stray CCs)
+    # 6) Geodesic distance cap (cuts distal PVs along the tube; drops stray CCs).
+    #    Pass la_full (TotalSeg LA body) so the adaptive cap can measure body extent.
     with T("geodesic centroid cap"):
-        pruned = geodesic_centroid_cap(grown, la_seed, MAX_GEODESIC_MM)
-    print(f"  after geodesic cap (<{MAX_GEODESIC_MM}mm in-mask from centroid): "
+        pruned, cap_info = geodesic_centroid_cap(grown, la_seed, body=la_full)
+    print(f"  after geodesic cap (<{cap_info['cap_mm']:.1f}mm in-mask from centroid): "
           f"{int(sitk.GetArrayFromImage(pruned).sum())} voxels")
 
     # 6b) Thin-branch removal: opening (mode-dependent) keeps the thick trunk
@@ -320,6 +380,8 @@ def grow_one(case):
         sitk.WriteImage(pruned, str(LA_DIR / f"{case}_LA.nii.gz"))
     print(f"  final: {n_final} voxels = {vol_ml:.1f} mL")
     print(f"[{case}] saved")
+    return {"case": case, "voxels": n_final, "vol_ml": vol_ml,
+            "cap_mm": cap_info["cap_mm"], "body_extent_mm": cap_info["body_extent_mm"]}
 
 # === Entry point ===
 if __name__ == "__main__":
