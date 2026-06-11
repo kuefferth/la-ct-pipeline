@@ -264,13 +264,20 @@ def geodesic_centroid_cap(mask, seed, body=None):
     if len(zs) == 0:
         return mask, {"cap_mm": float("nan"), "body_extent_mm": float("nan")}
 
-    # Centroid, then snap to the nearest ACTUAL seed voxel so the trial point is
-    # guaranteed inside the mask (speed=1) even if the body is non-convex and the
-    # raw centroid would land in a concavity.
+    # LA-seed centroid, then snap to the nearest voxel of the GROWN mask (the
+    # speed=1 region being capped) -- NOT the seed mask. The eroded TotalSeg seed
+    # can lie outside the grown body after forbidden-subtraction + largest-CC; a
+    # trial point there sits in speed=0, so FastMarching never propagates and the
+    # arrival field degenerates (body P90=0 -> cap clamps to the floor and empties
+    # the mask, e.g. case 621). Snapping into `mask` guarantees a valid front.
+    mask_arr = sitk.GetArrayFromImage(mask)
+    mzs, mys, mxs = np.where(mask_arr > 0)
+    if len(mzs) == 0:                       # grown mask empty -> nothing to cap
+        return mask, {"cap_mm": float("nan"), "body_extent_mm": float("nan")}
     cx, cy, cz = float(xs.mean()), float(ys.mean()), float(zs.mean())
-    d2 = (xs - cx) ** 2 + (ys - cy) ** 2 + (zs - cz) ** 2
+    d2 = (mxs - cx) ** 2 + (mys - cy) ** 2 + (mzs - cz) ** 2
     j = int(np.argmin(d2))
-    seed_idx = (int(xs[j]), int(ys[j]), int(zs[j]))   # (x, y, z) index
+    seed_idx = (int(mxs[j]), int(mys[j]), int(mzs[j]))   # (x, y, z) index, in-mask
     print(f"    geodesic seed index (x,y,z): {seed_idx}")
 
     # Speed = 1 inside mask, 0 outside. With speed 0 the front cannot leave the
@@ -290,6 +297,13 @@ def geodesic_centroid_cap(mask, seed, body=None):
         print(f"    adaptive cap: body P{CAP_PCTILE:.0f}={body_extent:.1f}mm, "
               f"size-scaled collar={collar:.1f}mm -> cap {cap_mm:.1f}mm "
               f"(clamp [{CAP_MIN_MM:.0f},{CAP_MAX_MM:.0f}])")
+        # Degenerate-field guard (belt-and-suspenders behind the in-mask seed snap):
+        # if the body was not properly reached (extent ~0 or nan) the arrival field
+        # is unreliable -> skip the cap and keep the pre-cap mask rather than risk
+        # emptying it.
+        if not np.isfinite(body_extent) or body_extent <= 0.0:
+            print("    [warn] degenerate geodesic field -> skipping cap (keep pre-cap mask)")
+            return mask, {"cap_mm": float("nan"), "body_extent_mm": body_extent}
     else:
         cap_mm, body_extent = MAX_GEODESIC_MM, float("nan")
 
