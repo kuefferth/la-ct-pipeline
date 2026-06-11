@@ -55,6 +55,14 @@ def mask_to_mesh(mask_path: Path, case: str):
     # out chirality-flipped (LAA on the wrong side). DICOMOrient keeps world coords.
     img = sitk.DICOMOrient(img, "LPS")
 
+    # Skip empty / degenerate masks (e.g. a case where 02b's geodesic cap collapsed
+    # to nothing). Without this, marching cubes yields a vertex-only/empty surface
+    # and compute_normals raises -- which would abort an entire batch on one bad
+    # case. Unattended batches must survive a single bad mask.
+    if int(np.count_nonzero(sitk.GetArrayFromImage(img))) == 0:
+        print(f"[{case}] EMPTY mask -- skipping mesh")
+        return
+
     # Pad with a background (0) border. Any foreground voxel that sat on the
     # volume edge now gets a 0 neighbour, so marching cubes produces a 0.5
     # crossing there and caps the surface. ConstantPad updates the origin, so
@@ -86,6 +94,11 @@ def mask_to_mesh(mask_path: Path, case: str):
     # Marching cubes at iso=0.5 (binary mask)
     with T("marching cubes"):
         surf = grid.contour([0.5], scalars="mask", method="marching_cubes")
+
+    # Guard against a degenerate contour (no faces) -- skip rather than crash.
+    if surf.n_points == 0 or surf.n_cells == 0:
+        print(f"[{case}] degenerate surface (no faces) -- skipping mesh")
+        return
 
     # Largest connected component (drops floating speckle)
     with T("largest CC"):
