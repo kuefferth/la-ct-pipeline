@@ -47,6 +47,14 @@ def mask_to_mesh(mask_path: Path, case: str):
     with T("read mask"):
         img = sitk.ReadImage(str(mask_path))
 
+    # Reorient to LPS canonical so the direction matrix becomes identity.
+    # pv.ImageData below is axis-aligned (origin + spacing only) and ignores the
+    # direction cosines, so any non-identity direction would mirror the mesh.
+    # Bern data is already LPS-identity (no-op); public datasets (e.g. ImageCAS,
+    # stored L-A-S with a negative-determinant affine) need this or the mesh comes
+    # out chirality-flipped (LAA on the wrong side). DICOMOrient keeps world coords.
+    img = sitk.DICOMOrient(img, "LPS")
+
     # Pad with a background (0) border. Any foreground voxel that sat on the
     # volume edge now gets a 0 neighbour, so marching cubes produces a 0.5
     # crossing there and caps the surface. ConstantPad updates the origin, so
