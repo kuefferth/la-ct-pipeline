@@ -95,6 +95,14 @@ BODY_REF_MM          = 32.0   # reference (typical) body extent; collar = PV_KEE
 CAP_MIN_MM           = 26.0   # safety floor: a degenerate/tiny seed can't collapse the
                               # cap into the body. Keep < (smallest real body + collar).
 CAP_MAX_MM           = 70.0   # safety ceiling: a leaky body can't blow it open.
+REACHED_MIN_FRAC     = 0.05  # REJECT the case if the in-mask geodesic front reaches
+                             # fewer than this fraction of the TotalSeg LA body voxels.
+                             # Near-zero = the grown region is topologically disconnected
+                             # from the LA (TotalSeg mislabel / off seed, e.g. spine on
+                             # case 621). A real LA's body is ~fully reachable, so this
+                             # only fires on broken cases; it does NOT recover them --
+                             # it emits an empty mask so the case self-excludes (03 skips
+                             # empties). Hard topological signal, not a tuned shape cutoff.
 OPEN_RADIUS_MM       = 2.0   # opening kernel radius. VALIDATED = 2.0 on the 2 legacy
                              # + 2 pcct scrap set, paired with CLOSE_MM=0: the carina
                              # held (the old recon2 fusion was the CLOSING, not the
@@ -293,17 +301,27 @@ def geodesic_centroid_cap(mask, seed, body=None):
     arrival = sitk.GetArrayFromImage(fm.Execute(speed))
 
     if ADAPTIVE_CAP and body is not None:
-        cap_mm, body_extent, collar = derive_adaptive_cap(arrival, sitk.GetArrayFromImage(body))
+        body_arr = sitk.GetArrayFromImage(body)
+        # Fraction of the TotalSeg LA body the in-mask geodesic front actually reached.
+        # If ~none of it is reachable, the grown region is disconnected from the LA
+        # (TotalSeg mislabel / off seed -- e.g. case 621 grew the spine). REJECT the
+        # case rather than recover it: a recovered mask here is plausible-by-volume
+        # garbage that could slip into training, whereas an empty mask self-excludes
+        # (03 skips empties). This is a hard topological test, not a shape heuristic.
+        n_body = int((body_arr > 0).sum())
+        reached_frac = float((arrival[body_arr > 0] < 1e6).sum()) / max(n_body, 1)
+        if reached_frac < REACHED_MIN_FRAC:
+            print(f"    [REJECT] grown mask reaches only {reached_frac:.1%} of the LA "
+                  f"body (< {REACHED_MIN_FRAC:.0%}) -> not LA (TotalSeg/seed failure); "
+                  f"emitting empty mask")
+            empty = sitk.Image(mask.GetSize(), mask.GetPixelID())
+            empty.CopyInformation(mask)
+            return empty, {"cap_mm": float("nan"), "body_extent_mm": float("nan"),
+                           "reached_frac": reached_frac, "rejected": True}
+        cap_mm, body_extent, collar = derive_adaptive_cap(arrival, body_arr)
         print(f"    adaptive cap: body P{CAP_PCTILE:.0f}={body_extent:.1f}mm, "
               f"size-scaled collar={collar:.1f}mm -> cap {cap_mm:.1f}mm "
-              f"(clamp [{CAP_MIN_MM:.0f},{CAP_MAX_MM:.0f}])")
-        # Degenerate-field guard (belt-and-suspenders behind the in-mask seed snap):
-        # if the body was not properly reached (extent ~0 or nan) the arrival field
-        # is unreliable -> skip the cap and keep the pre-cap mask rather than risk
-        # emptying it.
-        if not np.isfinite(body_extent) or body_extent <= 0.0:
-            print("    [warn] degenerate geodesic field -> skipping cap (keep pre-cap mask)")
-            return mask, {"cap_mm": float("nan"), "body_extent_mm": body_extent}
+              f"(clamp [{CAP_MIN_MM:.0f},{CAP_MAX_MM:.0f}]) | body reached={reached_frac:.0%}")
     else:
         cap_mm, body_extent = MAX_GEODESIC_MM, float("nan")
 
