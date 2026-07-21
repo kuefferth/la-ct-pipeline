@@ -54,7 +54,8 @@ Claude Code auto-loads `CLAUDE.md` from there. Rename if you prefer.
 ## Current pipeline
 
 ```
-data/<case>.zip                               DICOMs (gitignored)
+data/ct/<case>.zip                            DICOMs (gitignored; also accepts one
+data/ct/<batch dir>/<case>.zip                 level of batch subfolders, e.g. "1000 to 1498")
   -> 01_dicom_to_nifti.py                      series selection + per-patient dedup
 derivatives/nifti/<case>__{pcct,legacy}.nii.gz  one per patient (pcct preferred)
   -> 02_segment.py                             TotalSeg heartchambers_highres (CPU)
@@ -159,6 +160,54 @@ OPEN_RADIUS_MM=2.0, RECON_MM=2.0, CLOSE_MM=0. New OPEN_MODE options: "plain",
   can be inverse-mapped via `np.linalg.inv(T)`. Originals untouched.
 - Output coords: patient/world, LPS convention (SimpleITK + PyVista).
 
+### 3D-EAM integration (04c + 05) -- NEW, in progress
+
+Goal: map CARTO3 voltage onto the CT LA mesh, color by the standard scale, per-region
+stats (later via DIVAID), then predict voltage/scar from CT and link to outcomes
+(loop-recorder recurrence, ~400 pts).
+
+CARTO3 EXPORT FORMAT (validated on PiPAF8 sample, SW 8.1.1.944 / project 8.1.0.325):
+- The "single zip" (Export_*.zip) is a 7z archive mislabeled .zip. py7zr opens it
+  directly -- NO password, NOT encrypted. (The S###### folder with Study.zip.0NN +
+  StudyEncMetadata.xml is the OTHER, split/encrypted format; we do NOT use it. Both
+  start with the 7z magic 37 7A BC AF 27 1C.)
+- Contents: one .mesh + one _car.txt + thousands of per-point/ECG/MCC files per map.
+  Two maps here: 1-Map (6350 pts) and 1-1-ReMap (6059 pts, post-ablation; default).
+- _car.txt (VERSION_6_0): col4-6 = XYZ (mm, CARTO EM frame), col10 = Unipolar mV,
+  col11 = Bipolar mV, col12 = LAT ms (-10000 invalid), col17 = Category ('A'=accepted).
+  Confirmed against per-point XMLs (<Voltages Unipolar=.. Bipolar=..>).
+- .mesh = Biosense TriangulatedMeshVersion2.0: [VerticesSection]/[TrianglesSection]/
+  [VerticesColorsSection] (per-vertex Unipolar/Bipolar/LAT/Impedance/Force/... already
+  interpolated by CARTO; 10000 = invalid sentinel) + [VerticesAttributesSection].
+- TPI / contact NOT usable in this cohort: no force catheter -> Impedance=10000 on all
+  vertices, zero impedance samples in per-point XMLs, Force column empty. Quality filter
+  falls back to CARTO's 'A' acceptance flag only. If a force catheter is used later, the
+  .mesh Force column + VisiTagExport/ContactForceData.txt carry it.
+
+05_eam.py: extract car.txt+mesh (one 7z pass) -> parse points -> ICP-register CARTO mesh
+to CT mesh (centroid-align + vtkIterativeClosestPointTransform, rigid) -> apply T to EAM
+points -> IDW interpolate (k=10, r=10mm) bipolar/unipolar/LAT + binary scar to CT vertices
+-> also transfer CARTO's own mesh scalars as carto_* reference -> write
+derivatives/eam/<case>_LA_eam.vtk + _eam_points.csv + _eam_stats.csv (scar %, area, voltage
+percentiles). Bipolar scale: <0.5 mV scar, 0.5-1.5 border, >1.5 healthy. NOTE: ICP rotation
+relies on PV/LAA asymmetry; if a case's transform has large off-diagonals, add PCA init.
+
+PATIENT MATCHING (04c_eam_match.py): the CARTO export carries ONLY a procedure date
+(+ time, + lab study label like "PiPAF8") -- no PID/name/DOB. Chain: procedure date ->
+patients_merged.csv (prc_date1..5 -> PID, name, DOB) -> DCM-Test-Mapping.xlsx (PID<->
+Study-ID) -> derivatives/meshes/<StudyID>_0___do..._LA.vtk. Study label is NOT a reliable
+key (cross-center/lab duplicate labels possible). Date alone is specific (~3/5031) but
+cannot resolve same-day collisions (CSV has no time-of-day, export has no DOB) -> those
+are flagged `ambiguous` for manual review. Status per export: unique / ambiguous / no_ct /
+no_match. DE-ID: PHI crosswalk written to data/logs/eam_crosswalk.csv (gitignored);
+ALL derivatives stay keyed by Study-ID only (no date/PID/name in any derivatives/ name).
+Mapping files live in data/logs/ (patients_merged.csv, DCM-Test-Mapping.xlsx).
+
+OPEN: the PiPAF8 sample's 3 date-candidates are NOT in the 37-row DCM mapping (no_ct) --
+likely a demo export or its CT not yet added/mapped. Infra built + validated; needs a
+real EAM/CT pair to run end-to-end. Long-term: per-region stats via DIVAID; CT->scar
+prediction (anterior/posterior scar y/n); EAM<->outcome (Cox on recurrence).
+
 ---
 
 ## Decision log / key learnings (what was tried and rejected, and why)
@@ -233,6 +282,27 @@ OPEN_RADIUS_MM=2.0, RECON_MM=2.0, CLOSE_MM=0. New OPEN_MODE options: "plain",
 - DATA-DUP CHECK: content-hash the nifti when curating a cohort. Patient-ID dedup
   (01) misses same-scan-under-two-IDs duplicates (114==1111, 1348==4736 were found
   byte-identical; 1111 + the 47xx samples are being removed by the user).
+- SCALE-UP DATA LAYOUT CHANGE (2026-07): the bulk drop for the ~750-case scale-up
+  reorganized `data/` into `data/{ct,eam,logs}` subfolders, with CT zips further
+  split into batch subfolders (`data/ct/1000 to 1498/`, `.../1500 to 2000/`). 01's
+  `DATA_ROOT` still pointed at bare `data/`, so it silently treated `data/ct` itself
+  as a single "case" and rglob+dcmread'd every file under it (all ~750 zips) --
+  looked like a hang, not a crash (CPU/RAM churning on garbage DICOM parses of zip
+  bytes). Fixed: `DATA_ROOT = data/ct`; entry collection now descends one level
+  into any subfolder that directly contains zips (a "batch dir") instead of
+  treating it as one case. Verified no dup case IDs are silently dropped (9 cases
+  exist as both a loose top-level zip AND inside a batch dir -- same file,
+  idempotent skip handles it fine).
+- BATCH RUN NOW CATCHES PER-CASE ERRORS: 01 previously let any exception (e.g. a
+  corrupt zip) crash the whole run -- lost a 12h batch on file #600-ish when
+  `1653_0___do92390238.zip` (truncated 447 bytes short of the 4 GiB boundary,
+  likely a FAT32/export truncation) raised `BadZipFile`. 01 now wraps the per-case
+  body in try/except, logs `status=error` + exception text to selection_log.csv,
+  flushes the log after every case, and continues. Scanned all 765 zips for other
+  near-4GiB files: only that one is suspiciously short of the boundary (two others
+  are legitimately >4GiB and already converted fine) -- looks like an isolated
+  export truncation, not a systemic issue. That case still needs a re-export if
+  the CT is wanted.
 
 ## Status & open issues / roadmap
 
@@ -243,8 +313,13 @@ OPEN_RADIUS_MM=2.0, RECON_MM=2.0, CLOSE_MM=0. New OPEN_MODE options: "plain",
   meshes (4-voxel pad), carina fusion (CLOSE=0), short distal PVs (threshold -50->130),
   over-smoothing (g1.0/t100 -> g0.7/t60), duplicate patients (dedup) + duplicate data
   (content-hash; user removing 1111 + 47xx samples -> clean ~33-case production set).
-- NEXT MAJOR STEP: scale-up trial on ~200 cases (watch series-selection no_match like
-  2096, PA/RV leaks, carinas). Then evaluate DIVAID (open source, KIT-IBT) for PV
+- IN PROGRESS (2026-07): scale-up run underway on the full data/ct drop (~756 unique
+  cases, ~723 new beyond the 33 already converted). run_all.py running unattended
+  through 01-03; 01 hardened to log-and-skip per-case errors instead of dying (see
+  decision log). Watch for: series-selection no_match, PA/RV leaks, carina fusion,
+  and 02_segment CPU throughput at this volume (~6 min/case estimate from the
+  39-case cohort -- confirm it holds at ~750).
+- NEXT MAJOR STEP after this run lands: evaluate DIVAID (open source, KIT-IBT) for PV
   clipping + EHRA/EACVI 15-segment regional parcellation -- likely replaces the planned
   vmtk PV centerline cuts AND provides the canonical regional frame for EAM/outcome.
 - Residual medium PV stumps remain after r=2 opening (acceptable for a first geometry

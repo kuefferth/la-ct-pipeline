@@ -30,7 +30,7 @@ from collections import defaultdict
 import SimpleITK as sitk
 import pydicom
 
-DATA_ROOT = Path("data")
+DATA_ROOT = Path("data/ct")
 OUT_ROOT  = Path("derivatives/nifti")
 LOG_PATH  = Path("derivatives/selection_log.csv")
 
@@ -191,12 +191,17 @@ def convert(items, out_path: Path):
 
 # === Entry point ===
 if __name__ == "__main__":
-    # Collect entries: unzipped folders + per-case zips. Case name = folder name
-    # or zip stem.
+    # Collect entries: unzipped case folders + per-case zips, directly under
+    # DATA_ROOT. A directory that itself contains zip files (e.g. a batch drop
+    # folder like "1000 to 1498") is not a case -- descend one level into it.
     entries = []
     for p in sorted(DATA_ROOT.iterdir()):
         if p.is_dir():
-            entries.append((p.name, p))
+            batch_zips = sorted(c for c in p.iterdir() if c.suffix.lower() == ".zip")
+            if batch_zips:
+                entries.extend((c.stem, c) for c in batch_zips)
+            else:
+                entries.append((p.name, p))
         elif p.suffix.lower() == ".zip":
             entries.append((p.stem, p))
 
@@ -236,32 +241,41 @@ if __name__ == "__main__":
                           pcct_sib[0].name])
             continue
 
-        with case_source(entry) as case_dir:
-            series = group_series(case_dir)
+        # Per-case errors (corrupt zip, unreadable DICOM, etc.) are logged and
+        # skipped rather than killing a multi-hour batch run.
+        try:
+            with case_source(entry) as case_dir:
+                series = group_series(case_dir)
 
-            chosen = None
-            prof_name = None
-            for name, fn in PROFILES:
-                chosen = fn(series)
-                if chosen is not None:
-                    prof_name = name
-                    break
+                chosen = None
+                prof_name = None
+                for name, fn in PROFILES:
+                    chosen = fn(series)
+                    if chosen is not None:
+                        prof_name = name
+                        break
 
-            if chosen is None:
-                print(f"  [skip] no matching series (any profile)")
-                log.writerow([case_name, "", "", "", "", "", "",
-                              "no_match", ""])
-                continue
+                if chosen is None:
+                    print(f"  [skip] no matching series (any profile)")
+                    log.writerow([case_name, "", "", "", "", "", "",
+                                  "no_match", ""])
+                    continue
 
-            n = len(chosen["items"])
-            tp = chosen["tp"] if chosen["tp"] is not None else ""
-            print(f"  profile={prof_name}  series {chosen['ser']}  "
-                  f"acq={chosen['acq']}  TP={tp}  FOV={chosen['fov']:.0f}  n={n}")
+                n = len(chosen["items"])
+                tp = chosen["tp"] if chosen["tp"] is not None else ""
+                print(f"  profile={prof_name}  series {chosen['ser']}  "
+                      f"acq={chosen['acq']}  TP={tp}  FOV={chosen['fov']:.0f}  n={n}")
 
-            out_path = OUT_ROOT / f"{case_name}__{prof_name}.nii.gz"
-            convert(chosen["items"], out_path)
-            log.writerow([case_name, prof_name, chosen["ser"], chosen["acq"],
-                          tp, f"{chosen['fov']:.1f}", n, "ok", out_path.name])
+                out_path = OUT_ROOT / f"{case_name}__{prof_name}.nii.gz"
+                convert(chosen["items"], out_path)
+                log.writerow([case_name, prof_name, chosen["ser"], chosen["acq"],
+                              tp, f"{chosen['fov']:.1f}", n, "ok", out_path.name])
+        except Exception as e:
+            print(f"  [error] {type(e).__name__}: {e}")
+            log.writerow([case_name, "", "", "", "", "", "", "error",
+                          f"{type(e).__name__}: {e}"])
+        finally:
+            log_f.flush()
 
     # === Per-patient dedup: keep one series per patient (prefer pcct over legacy).
     # Self-healing and idempotent -- scans whatever NIfTI exists, groups by patient,
