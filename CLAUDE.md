@@ -31,10 +31,12 @@ Claude Code auto-loads `CLAUDE.md` from there. Rename if you prefer.
   2 TB NVMe, Windows) for portability + Oxford visits.
 - Python 3.11, Miniconda env `la`. VS Code, Git for Windows, cmd.exe with
   `conda init cmd.exe`. 3D Slicer / ParaView for QC.
-- Repo: github.com/kuefferth/la-ct-pipeline (private). Now lives on external SSD
-  at `D:\la-ct-pipeline` (was `C:\Users\cit\Documents\...`). After the move, Git
-  threw "dubious ownership"; fixed with
-  `git config --global --add safe.directory D:/la-ct-pipeline`.
+- Repo: github.com/kuefferth/la-ct-pipeline (private). Now lives on a new
+  BitLocker-encrypted HD at `F:\oxford\la-ct-pipeline` (was `D:\la-ct-pipeline`,
+  before that `C:\Users\cit\Documents\...`). This move did NOT throw "dubious
+  ownership" (unlike the D: move), so no new `safe.directory` entry was needed;
+  the stale `D:/la-ct-pipeline` entry in `C:\Users\cit\.gitconfig` is harmless
+  and was left in place.
 - `data/` and `derivatives/` are gitignored. Patient CT must never hit GitHub.
 - Stack: totalsegmentator, SimpleITK, pydicom, nibabel, numpy, scipy, vtk,
   pyvista, tqdm. `torch==2.5.1+cu121` + `torchvision==0.20.1+cu121` (matched pair,

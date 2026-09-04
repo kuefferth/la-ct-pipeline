@@ -15,12 +15,13 @@ Run (divaid env):
   python src/_seed_analysis.py
 """
 import sys, glob, os
-sys.path.insert(0, r"D:\la-ct-pipeline\third_party\divaid\src")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO_ROOT, "third_party", "divaid", "src"))
 import numpy as np
 from vtk.util.numpy_support import vtk_to_numpy
 from utils import read_vtk, threshold_filter, get_connected_regions, add_array_to_mesh
 
-ROOT = r"D:\la-ct-pipeline\derivatives\parcellation"
+ROOT = os.path.join(REPO_ROOT, "derivatives", "parcellation")
 LADDER = [8, 10, 12, 15, 18, 22]
 MIN_REGION_PTS = 80
 
