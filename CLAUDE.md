@@ -58,6 +58,8 @@ Claude Code auto-loads `CLAUDE.md` from there. Rename if you prefer.
 ```
 data/ct/<case>.zip                            DICOMs (gitignored; also accepts one
 data/ct/<batch dir>/<case>.zip                 level of batch subfolders, e.g. "1000 to 1498")
+D:/la-ct-raw/<batch dir>/<case>.zip           overflow raw CT (second T7 drive), filled by
+                                               01d_move_raw_ct.py; 01 searches both roots
   -> 01_dicom_to_nifti.py                      series selection + per-patient dedup
 derivatives/nifti/<case>__{pcct,legacy}.nii.gz  one per patient (pcct preferred)
   -> 02_segment.py                             TotalSeg heartchambers_highres (CPU)
@@ -98,6 +100,78 @@ plus probes `00d_why_skipped`, `00e_oldscanner_probe`, `00f_phase_probe`,
   "Bv40f", so naive matching silently skips every series. `01` now has a
   `kernel_str()` helper that returns the first element in both cases. All ~3k
   production cases will have the multi-valued form, so this fix is load-bearing.
+
+### CT disk relief (2026-10): overflow drive for raw CT (01d), optional 4D prune (01c)
+
+PRIMARY approach = move raw zips, delete nothing. 01 now searches several raw roots
+(`DATA_ROOTS` in 01: `data/ct`, then `D:/la-ct-raw` on the second T7 drive; override
+with env `LA_CT_ROOTS`, os.pathsep separated; a missing root only warns). A case name in
+two roots is listed once (primary wins). `src/01d_move_raw_ct.py` moves zips of cases that
+already have a NIfTI to the overflow root: copy to .part, size + full zip CRC check, atomic
+rename, then delete the source; resumable, keeps batch subfolders, logs to
+`data/logs/ct_move_log.csv`. Dry-run by default (`--apply`, `--max-gb`, `--fast`,
+`--include-unconverted`). First dry-run: 652 converted zips = 749 GB movable, 1746 still
+unconverted. Steps 02/02b/03 read only the NIfTI, so the zips are needed only to re-run 01.
+D: must be encrypted like F: (BitLocker); its status could not be checked from the tool
+(user confirmed D: is encrypted, 2026-10).
+
+ROUTINE (manual, not part of run_all): new CT drops go into `data/ct/<batch>/` on F: as
+before. After 01 has converted them, run
+`python src/01d_move_raw_ct.py` (dry-run, shows GB) then `... --apply` to move the
+converted zips to `D:/la-ct-raw/` (same batch subfolders). Nothing else changes: 01 keeps
+skipping cases that have a NIfTI, and still finds a zip on D: if a case must be re-run.
+D: unplugged -> 01 warns "raw CT root not found" and skips cases stored there.
+Done once so far: 2026-10-20, 652 zips / 749 GB moved (log: data/logs/ct_move_log.csv).
+
+Optional second lever, NOT applied (user preferred keeping all data):
+
+`src/01c_prune_4d.py` removes ONLY the multiphase 4D gate stacks from the study zips
+(legacy scanner: one series with all phases, `GATE_nn_OF_21`, 1.5-1.7 GB of a ~1.8 GB
+zip). Everything else is kept as is (cardiac + thorax FOV, 3 mm, VNC/iodine maps, venous
+601, extra acquisitions 701+). Decision: keep all other CT, we may need the iodine maps /
+thorax FOV / late-iodine scans later. Cases that had a 4D stack are listed in
+`data/logs/ct_4d_cases.csv` (case, profile, n_phases, files, MB) so they can be
+re-exported if the phases are ever needed.
+- Rewrites each zip IN PLACE (same path/name), lossless DICOM. Dry-run by default;
+  `--apply` to write; `--archive-dir D:/ct_full` copies the original first.
+- Only touches cases whose NIfTI exists (>10 min old). Verifies CRC, per-series file
+  counts and that 01's picker selects the same series before an atomic os.replace.
+  Pruned zips carry zip comment "LA-CT-PRUNE4D v1"; zips without 4D are recorded in
+  `data/logs/ct_prune_log.csv`. Both are skipped on rerun.
+- 01 stays incremental: it skips any case with a NIfTI before opening the zip, and a
+  deleted zip is simply not an entry. 01's selection_log.csv is now APPEND-only (it
+  used to be rewritten each run) and logs only ok/no_match/error/removed_dup rows.
+- GOTCHA: pcct recons carry `GATE_01_OF_01` (single phase), so 01's `has_gate()`
+  ("GATE_" substring) is only valid for the legacy picker. 01c uses `GATE_nn_OF_mm`
+  with mm>1 for 4D stacks. Single-phase legacy recons (TP10/20/30, ~70-80 MB) are kept.
+- If space is still short later: raw zips are only needed to RE-run 01 (the later
+  steps read NIfTI), so they can be moved to cold storage once 01 is done.
+
+### Nightly window (2026-10): run_all only 19:00-07:00 via Task Scheduler
+
+The work PC lagged during the ~6-7 day CPU segmentation, so the pipeline now runs only at
+night. Windows Task Scheduler task `LA-CT nightly` (daily 19:00, interactive logon of the
+user so it needs a logged-in session, locked screen is fine; WakeToRun, StartWhenAvailable,
+runs on battery, MultipleInstances=IgnoreNew, 13 h limit) starts `src/nightly.py` via the
+`la` env's `pythonw.exe` (no console window). Env python: `C:\Users\cit\.conda\envs\la`
+(the PATH `python` is a different install without totalsegmentator).
+- `nightly.py`: only starts inside 19:00-07:00 (a late catch-up start at noon does
+  nothing), sets env `LA_STOP_AT` (epoch of the next 07:00), runs `run_all.py` at
+  BELOW_NORMAL priority (children inherit), logs to `derivatives/logs/nightly_<date>.log`,
+  hard-kills the tree 30 min after the stop time as a backstop only.
+- COOPERATIVE STOP: `src/_deadline.py` `time_up()` reads `LA_STOP_AT`; 01/02/02b/03 check it
+  at the top of their per-case loop and `break`; `run_all.py` exits after the step in which
+  time ran out. The last case may overrun a few minutes. Manual runs (no env var) never
+  stop. WHY: none of 01/02/02b/03 write atomically, a hard kill truncates the file being
+  written (seen: a truncated `976_...pcct.nii.gz`, gzip "unexpected end of file"; 02's
+  `if not seg_out.exists()` would then trust a half-written segmentation). If a backstop
+  kill ever fires, `gzip -t` the newest files in nifti/ and seg_full/ and delete bad ones.
+- Idempotent, so each night continues where the last stopped. Pause: disable the task in
+  Task Scheduler. Manual run: `python src/run_all.py` with the `la` env, any time.
+- Python background tasks started from a Claude session die when the session ends; the
+  scheduled task does not.
+- Priority "Idle" on a manual run did NOT stop the lag (01 is disk-IO heavy: zip extract
+  + DICOM read), which is why it moved to a nightly window rather than lower priority.
 
 ### Region-grow refinement (02b) — current = v8
 
@@ -321,6 +395,14 @@ prediction (anterior/posterior scar y/n); EAM<->outcome (Cox on recurrence).
   decision log). Watch for: series-selection no_match, PA/RV leaks, carina fusion,
   and 02_segment CPU throughput at this volume (~6 min/case estimate from the
   39-case cohort -- confirm it holds at ~750).
+- STATE 2026-10-27: raw CT now ~2480 zips / ~2190 unique patients (drop grew to batch
+  "3000 to 3119"). The user FLATTENED data/ct (batch subfolders -> loose zips); 01 lists
+  entries at start, so zips moved while a run is going give FileNotFoundError (logged, the
+  case is retried next run). 01 has converted ~2160 patients to NIfTI; segmentation
+  (02/02b/03) is still only the original 680 (678 meshes; 1659_..legacy and imagecas_621
+  have an LA mask but no mesh, not yet investigated). Remaining ~1500 cases run via the
+  nightly window (~120 cases/night at ~6 min/case, i.e. roughly 12-13 nights).
+  run_all.py runs ALL of 01 first, then 02, 02b, 03 over everything.
 - NEXT MAJOR STEP after this run lands: evaluate DIVAID (open source, KIT-IBT) for PV
   clipping + EHRA/EACVI 15-segment regional parcellation -- likely replaces the planned
   vmtk PV centerline cuts AND provides the canonical regional frame for EAM/outcome.

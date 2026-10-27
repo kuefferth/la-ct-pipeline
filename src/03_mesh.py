@@ -16,6 +16,7 @@ from pathlib import Path
 import SimpleITK as sitk
 import numpy as np
 import pyvista as pv
+from _deadline import time_up
 
 LA_DIR   = Path("derivatives/seg_la")
 MESH_DIR = Path("derivatives/meshes")
@@ -134,6 +135,9 @@ if __name__ == "__main__":
         case = mask_path.name.replace("_LA.nii.gz", "")
         if cases_filter and case not in cases_filter:
             continue
+        if time_up():                      # nightly window over: stop between cases
+            print("[stop] time window over")
+            break
         out_vtk = MESH_DIR / f"{case}_LA.vtk"
         out_stl = MESH_DIR / f"{case}_LA.stl"
         if SKIP_EXISTING and not cases_filter and out_vtk.exists() and out_stl.exists():

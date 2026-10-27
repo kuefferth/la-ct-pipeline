@@ -18,6 +18,7 @@ drop the legacy. Patient ID = the token before the first '_0___' study separator
 Dedup happens at the NIfTI stage (here), so 02/02b/03 -- which iterate over whatever
 NIfTI exists -- naturally see one-per-patient with no per-stage dedup needed.
 """
+import os
 import re
 import csv
 import zipfile
@@ -30,7 +31,17 @@ from collections import defaultdict
 import SimpleITK as sitk
 import pydicom
 
-DATA_ROOT = Path("data/ct")
+from _deadline import time_up
+
+# Raw CT locations, searched in order. DATA_ROOT is the primary (new drops land
+# here); the second root is the overflow drive that 01d_move_raw_ct.py moves already
+# converted studies to. Override the whole list with env LA_CT_ROOTS (os.pathsep
+# separated) if the drive letter changes. A root that does not exist (drive not
+# connected) is skipped with a warning.
+DATA_ROOTS = ([Path(p) for p in os.environ["LA_CT_ROOTS"].split(os.pathsep) if p]
+              if os.environ.get("LA_CT_ROOTS")
+              else [Path("data/ct"), Path("D:/la-ct-raw")])
+DATA_ROOT = DATA_ROOTS[0]
 OUT_ROOT  = Path("derivatives/nifti")
 LOG_PATH  = Path("derivatives/selection_log.csv")
 
@@ -189,13 +200,12 @@ def convert(items, out_path: Path):
     sitk.WriteImage(img, str(out_path))
     print(f"  wrote {out_path.name}  shape={img.GetSize()}  spacing={img.GetSpacing()}")
 
-# === Entry point ===
-if __name__ == "__main__":
-    # Collect entries: unzipped case folders + per-case zips, directly under
-    # DATA_ROOT. A directory that itself contains zip files (e.g. a batch drop
-    # folder like "1000 to 1498") is not a case -- descend one level into it.
+def collect_entries(root: Path):
+    """(case_name, path) for unzipped case folders + per-case zips directly under
+    root. A directory that itself contains zip files (e.g. a batch drop folder like
+    "1000 to 1498") is not a case -- descend one level into it."""
     entries = []
-    for p in sorted(DATA_ROOT.iterdir()):
+    for p in sorted(root.iterdir()):
         if p.is_dir():
             batch_zips = sorted(c for c in p.iterdir() if c.suffix.lower() == ".zip")
             if batch_zips:
@@ -204,28 +214,66 @@ if __name__ == "__main__":
                 entries.append((p.name, p))
         elif p.suffix.lower() == ".zip":
             entries.append((p.stem, p))
+    return entries
 
-    # Open the selection log (UTF-8 BOM so Excel on a German locale reads umlauts).
+def collect_all_entries(roots=None):
+    """collect_entries over every raw root (primary first). A case name found in
+    more than one root is listed once (first root wins): a leftover duplicate can
+    only come from an interrupted move, and both copies are then complete."""
+    roots = DATA_ROOTS if roots is None else roots
+    seen, entries = set(), []
+    for i, root in enumerate(roots):
+        if not root.exists():
+            print(f"[warn] raw CT root not found: {root}"
+                  + ("" if i == 0 else "  (drive not connected? cases stored there are skipped)"))
+            continue
+        for name, path in collect_entries(root):
+            if name not in seen:
+                seen.add(name)
+                entries.append((name, path))
+    return entries
+
+def nifti_paths(case_name: str):
+    """Existing NIfTI files for this case (either profile, or the old un-suffixed
+    name used by the 4733-4738 samples)."""
+    paths = list(OUT_ROOT.glob(f"{case_name}__*.nii.gz"))
+    old = OUT_ROOT / f"{case_name}.nii.gz"
+    if old.exists():
+        paths.append(old)
+    return paths
+
+def nifti_exists(case_name: str) -> bool:
+    """True if a NIfTI for this case is already there (either profile, or the old
+    un-suffixed name used by the 4733-4738 samples)."""
+    return (any(OUT_ROOT.glob(f"{case_name}__*.nii.gz"))
+            or (OUT_ROOT / f"{case_name}.nii.gz").exists())
+
+# === Entry point ===
+if __name__ == "__main__":
+    entries = collect_all_entries()
+
+    # Selection log is cumulative (append): the source zips may later be slimmed or
+    # removed (01c_slim_ct.py), so this is the lasting record of what was chosen.
+    # UTF-8 BOM so Excel on a German locale reads umlauts. Only actionable rows are
+    # logged (ok / no_match / error / removed_dup); idempotent skips are not.
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    log_f = open(LOG_PATH, "w", newline="", encoding="utf-8-sig")
+    new_log = not LOG_PATH.exists() or LOG_PATH.stat().st_size == 0
+    log_f = open(LOG_PATH, "a", newline="", encoding="utf-8-sig" if new_log else "utf-8")
     log = csv.writer(log_f, delimiter=";")     # ; plays nicer with German Excel
-    log.writerow(["case", "profile", "series", "acq", "tp_pct", "fov_mm",
-                  "n_files", "status", "out_file"])
+    if new_log:
+        log.writerow(["case", "profile", "series", "acq", "tp_pct", "fov_mm",
+                      "n_files", "status", "out_file"])
 
     for case_name, entry in entries:
-        print(f"\n[{case_name}]")
-
+        if time_up():                      # nightly window over: stop between cases
+            print("[stop] time window over, stopping before", case_name)
+            break
         # Idempotent: skip if either profile's output already exists. Check before
-        # extraction so reruns cost no IO.
-        existing = list(OUT_ROOT.glob(f"{case_name}__*.nii.gz"))
-        # Back-compat: also honor an old un-suffixed NIfTI (e.g. 4733-4738).
-        if (OUT_ROOT / f"{case_name}.nii.gz").exists():
-            existing.append(OUT_ROOT / f"{case_name}.nii.gz")
-        if existing:
-            print(f"  [skip] exists: {existing[0].name}")
-            log.writerow([case_name, "", "", "", "", "", "", "skip_exists",
-                          existing[0].name])
+        # extraction so reruns cost no IO (and work the same once the source zip was
+        # slimmed or deleted: a missing zip is simply not an entry).
+        if nifti_exists(case_name):
             continue
+        print(f"\n[{case_name}]")
 
         # Dedup skip: if a pcct survivor already exists for this patient from a
         # DIFFERENT study, this entry is a superseded duplicate -- skip without
@@ -237,8 +285,6 @@ if __name__ == "__main__":
                     if not p.name.startswith(f"{case_name}__")]
         if pcct_sib:
             print(f"  [skip] superseded by pcct sibling: {pcct_sib[0].name}")
-            log.writerow([case_name, "", "", "", "", "", "", "skip_dup_pcct",
-                          pcct_sib[0].name])
             continue
 
         # Per-case errors (corrupt zip, unreadable DICOM, etc.) are logged and

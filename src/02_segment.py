@@ -11,6 +11,7 @@ from pathlib import Path
 import SimpleITK as sitk
 import numpy as np
 from totalsegmentator.python_api import totalsegmentator
+from _deadline import time_up
 
 NIFTI_DIR = Path("derivatives/nifti")
 SEG_DIR   = Path("derivatives/seg_full")
@@ -25,6 +26,9 @@ def run():
     LA_DIR.mkdir(parents=True, exist_ok=True)
     SEG_DIR.mkdir(parents=True, exist_ok=True)
     for nii in sorted(NIFTI_DIR.glob(GLOB)):
+        if time_up():                      # nightly window over: stop between cases
+            print("[stop] time window over")
+            break
         case = nii.name.replace(".nii.gz", "")
         seg_out = SEG_DIR / f"{case}_chambers.nii.gz"
         if not seg_out.exists():

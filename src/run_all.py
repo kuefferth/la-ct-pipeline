@@ -11,6 +11,8 @@ import time
 import ctypes
 from pathlib import Path
 
+from _deadline import time_up
+
 STEPS = [
     "01_dicom_to_nifti.py",
     "02_segment.py",
@@ -53,6 +55,9 @@ def main():
                 print(f"\n!! {step} failed (returncode={result.returncode}) after {dt:.1f}s")
                 sys.exit(result.returncode)
             print(f"\n--- {step} done in {dt:.1f}s")
+            if time_up():
+                print("\n[run_all] stop time reached, exiting cleanly (rerun continues)")
+                break
         print(f"\n[run_all] total: {time.perf_counter() - t_total:.1f}s")
     finally:
         keep_awake(False)       # always restore, even on error/exit

@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 import SimpleITK as sitk
 import numpy as np
+from _deadline import time_up
 
 # === Paths ===
 NIFTI_DIR = Path("derivatives/nifti")
@@ -424,6 +425,9 @@ if __name__ == "__main__":
         case = nii.name.replace(".nii.gz", "")
         if cases_filter and case not in cases_filter:
             continue
+        if time_up():                      # nightly window over: stop between cases
+            print("[stop] time window over")
+            break
         print(f"\n[{case}] region-growing...")
         grow_one(case)
     print(f"\n[total] {time.perf_counter() - t_total:.1f}s")
