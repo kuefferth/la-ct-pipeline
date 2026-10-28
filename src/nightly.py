@@ -16,6 +16,11 @@ from pathlib import Path
 START_H, STOP_H = 19, 7
 GRACE_MIN = 30
 BELOW_NORMAL = 0x00004000          # child processes inherit this priority class
+NO_WINDOW = 0x08000000             # hidden console for run_all + its steps
+# This script itself runs under pythonw.exe (Task Scheduler, no window), but pythonw
+# children lose stdout/stderr (the 2026-10-27 night log was empty and 02 died without a
+# traceback). run_all and the steps therefore run under python.exe with a hidden console.
+PYTHON = Path(sys.executable).with_name("python.exe")
 
 ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = ROOT / "derivatives" / "logs"
@@ -45,9 +50,9 @@ def main():
     with open(log_path, "a", encoding="utf-8") as lf:
         lf.write(f"\n##### nightly start {now:%Y-%m-%d %H:%M}, stop at {stop:%Y-%m-%d %H:%M}\n")
         lf.flush()
-        proc = subprocess.Popen([sys.executable, "-u", str(ROOT / "src" / "run_all.py")],
+        proc = subprocess.Popen([str(PYTHON), "-u", str(ROOT / "src" / "run_all.py")],
                                 cwd=ROOT, env=env, stdout=lf, stderr=subprocess.STDOUT,
-                                creationflags=BELOW_NORMAL)
+                                creationflags=BELOW_NORMAL | NO_WINDOW)
         hard = stop.timestamp() + GRACE_MIN * 60
         while proc.poll() is None:
             if time.time() > hard:

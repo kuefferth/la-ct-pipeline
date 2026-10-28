@@ -155,6 +155,13 @@ user so it needs a logged-in session, locked screen is fine; WakeToRun, StartWhe
 runs on battery, MultipleInstances=IgnoreNew, 13 h limit) starts `src/nightly.py` via the
 `la` env's `pythonw.exe` (no console window). Env python: `C:\Users\cit\.conda\envs\la`
 (the PATH `python` is a different install without totalsegmentator).
+GOTCHA (first night, 2026-10-27): programs started FROM a pythonw process lose stdout/stderr
+(night log had only run_all's own headers, and 02 died after 4.5 min with rc=1 and no
+traceback; 01 had run fine for 7.6 h and converted ~280 cases). nightly.py is the only
+pythonw part now; it starts run_all with `python.exe` + CREATE_NO_WINDOW (hidden console)
++ BELOW_NORMAL. Verified afterwards: 02 under python.exe segments a case (~6.5 min at
+below-normal) and stops cleanly on LA_STOP_AT. 02 also skips cases that already have both
+seg_full and LA_seed (it used to re-extract ~700 seeds every night, ~5 min).
 - `nightly.py`: only starts inside 19:00-07:00 (a late catch-up start at noon does
   nothing), sets env `LA_STOP_AT` (epoch of the next 07:00), runs `run_all.py` at
   BELOW_NORMAL priority (children inherit), logs to `derivatives/logs/nightly_<date>.log`,

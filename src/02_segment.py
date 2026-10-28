@@ -31,6 +31,9 @@ def run():
             break
         case = nii.name.replace(".nii.gz", "")
         seg_out = SEG_DIR / f"{case}_chambers.nii.gz"
+        seed_out = LA_DIR / f"{case}_LA_seed.nii.gz"
+        if seg_out.exists() and seed_out.exists():
+            continue                       # done (re-extracting ~700 seeds cost ~5 min a night)
         if not seg_out.exists():
             print(f"[{case}] segmenting (heartchambers_highres, force_split)...")
             # force_split = z-chunks, fits 6GB VRAM on GTX 1060
