@@ -162,8 +162,20 @@ pythonw part now; it starts run_all with `python.exe` + CREATE_NO_WINDOW (hidden
 + BELOW_NORMAL. Verified afterwards: 02 under python.exe segments a case (~6.5 min at
 below-normal) and stops cleanly on LA_STOP_AT. 02 also skips cases that already have both
 seg_full and LA_seed (it used to re-extract ~700 seeds every night, ~5 min).
-- `nightly.py`: only starts inside 19:00-07:00 (a late catch-up start at noon does
-  nothing), sets env `LA_STOP_AT` (epoch of the next 07:00), runs `run_all.py` at
+- WEEKEND MODE (2026-11-03): the PC is free Sat/Sun/Mon, so `stop_time()` only blocks
+  Tue-Fri 07:00-19:00 (BUSY_DAYS). The Fri 19:00 start runs non-stop until Tue 07:00 (84 h);
+  the daily 19:00 trigger on Sat/Sun/Mon is ignored while it runs (IgnoreNew). Task time
+  limit raised 13 h -> 96 h (P4D) for that. Change BUSY_DAYS in nightly.py to adjust.
+- 02 IS NOW FAILURE-TOLERANT: nights 10-31..11-02 were lost because one case raised
+  `ArrayMemoryError: Unable to allocate 1.05 GiB` (16 GB PC, only ~2 GB free when idle with
+  Chrome/Citrix open) inside nnU-Net preprocessing; the exception killed 02, run_all exited
+  rc=1, and the next night hit it again. 02 now try/excepts per case (removes the partial
+  seg_full/seed file, logs `derivatives/logs/seg_failures.csv`, sleeps 30 s, continues),
+  skips a case after MAX_FAILS=3 logged failures (delete its rows to retry), and waits up to
+  10 min for >= 6 GB free RAM (psutil) before starting a case. Check seg_failures.csv after
+  a night.
+- `nightly.py`: only starts when stop_time() allows it (a start in Tue-Fri daytime does
+  nothing), sets env `LA_STOP_AT` (epoch of the next busy-day 07:00), runs `run_all.py` at
   BELOW_NORMAL priority (children inherit), logs to `derivatives/logs/nightly_<date>.log`,
   hard-kills the tree 30 min after the stop time as a backstop only.
 - COOPERATIVE STOP: `src/_deadline.py` `time_up()` reads `LA_STOP_AT`; 01/02/02b/03 check it
@@ -410,6 +422,14 @@ prediction (anterior/posterior scar y/n); EAM<->outcome (Cox on recurrence).
   have an LA mask but no mesh, not yet investigated). Remaining ~1500 cases run via the
   nightly window (~120 cases/night at ~6 min/case, i.e. roughly 12-13 nights).
   run_all.py runs ALL of 01 first, then 02, 02b, 03 over everything.
+- STATE 2026-11-03: nightly runs since 10-28 raised seg_full 682 -> 939 (~257 cases in the
+  nights that did not crash). 02/02b/03 are ordered, so LA masks (02b) and meshes (03) do
+  not advance until ALL of 02 is done (still 680 / 678). ~300 new zips arrived (unique
+  patients 2188 -> 2765; ~407 patients without NIfTI yet); 01 runs first each night
+  (~1.6 min/case, a ~10 h night for 400 cases). 5 zips fail 01 every night with
+  `BadZipFile: File is not a zip file` (1463_0___do92405598, 1473_0___do92393379,
+  1681_0___do92391833, 30_0___do92390201, 337_0___do92391391) -> bad exports, need
+  re-export. Remaining to segment ~1500 + new.
 - NEXT MAJOR STEP after this run lands: evaluate DIVAID (open source, KIT-IBT) for PV
   clipping + EHRA/EACVI 15-segment regional parcellation -- likely replaces the planned
   vmtk PV centerline cuts AND provides the canonical regional frame for EAM/outcome.

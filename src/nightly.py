@@ -1,4 +1,5 @@
-"""Nightly window runner: runs run_all.py between START_H and STOP_H (default 19:00-07:00).
+"""Nightly window runner: runs run_all.py 19:00-07:00 on Tue-Fri and non-stop from Fri 19:00
+to Tue 07:00 (weekend + Monday, the PC is free then); see stop_time().
 
 Started by Windows Task Scheduler at 19:00 (task "LA-CT nightly"). Sets LA_STOP_AT so the
 steps stop cleanly BETWEEN cases at the stop hour (the last case may overrun by a few
@@ -26,22 +27,27 @@ ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = ROOT / "derivatives" / "logs"
 
 
+BUSY_DAYS = {1, 2, 3, 4}           # Tue-Fri: the PC is in use 07:00-19:00. Sat/Sun/Mon: free.
+
+
 def stop_time(now: dt.datetime):
-    """Next STOP_H after 'now' if we are inside the window, else None."""
-    if now.hour >= START_H:
-        day = now.date() + dt.timedelta(days=1)
-    elif now.hour < STOP_H:
-        day = now.date()
-    else:
+    """When to stop if running is allowed at 'now', else None.
+
+    Not allowed: Tue-Fri 07:00-19:00. Otherwise run until the next 07:00 that starts a
+    busy day, i.e. nightly on weekdays and straight through Fri 19:00 -> Tue 07:00."""
+    if now.weekday() in BUSY_DAYS and STOP_H <= now.hour < START_H:
         return None
-    return dt.datetime.combine(day, dt.time(STOP_H))
+    for add in range(8):
+        cand = dt.datetime.combine(now.date() + dt.timedelta(days=add), dt.time(STOP_H))
+        if cand > now and cand.weekday() in BUSY_DAYS:
+            return cand
 
 
 def main():
     now = dt.datetime.now()
     stop = stop_time(now)
     if stop is None:
-        print(f"{now:%H:%M} is outside the {START_H}:00-{STOP_H}:00 window, not starting")
+        print(f"{now:%a %H:%M} is a busy-hours slot (Tue-Fri {STOP_H}:00-{START_H}:00), not starting")
         return
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"nightly_{now:%Y%m%d}.log"
