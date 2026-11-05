@@ -430,6 +430,20 @@ prediction (anterior/posterior scar y/n); EAM<->outcome (Cox on recurrence).
   `BadZipFile: File is not a zip file` (1463_0___do92405598, 1473_0___do92393379,
   1681_0___do92391833, 30_0___do92390201, 337_0___do92391391) -> bad exports, need
   re-export. Remaining to segment ~1500 + new.
+- CT STATUS 2026-11-04 (raw CT collection COMPLETE): request list `data/logs/RITM0432969_main.xlsx`
+  (3,118 study IDs, 1..3119) vs Synedra AIM export `data/logs/ritm0432969 AIM ID.txt`
+  (3,135 documents / 2,764 studies). 354 requested IDs are NOT in the AIM export (probably
+  ablation-cohort patients without a CT; nothing to fetch, listed in the gitignored
+  `data/logs/synedra_missing.csv`). All 2,764 studies on the AIM list have a readable zip.
+  3,146 zip files (F: data/ct flat + D:/la-ct-raw flat) = 2,765 UNIQUE PATIENTS (2,764 + the
+  off-list ID 2595); the rest are second studies per ID. The 5 bad exports above were
+  re-exported/recopied 2026-11-03/04 and pass a full CRC test (337, 30, 1463, 1473, 1681).
+  Bad zips that still fail but have a good second study: 536, 540 (good copy on D), 1653
+  (truncated at the 4 GiB mark, second zip converted). NIfTI exists for 2,641 patients,
+  so ~157 still need 01 (incl. 337, 1473, 1681; 30 and 1463 already have a NIfTI from
+  their second zip). Segmentation: seg_full 939, LA masks
+  + meshes still 678 (02b/03 wait for all of 02). Coverage chart: Artifact "CT Case
+  Coverage" (claude.ai/artifact/SuafVS9nnF8qJLkJTZKP7K).
 - NEXT MAJOR STEP after this run lands: evaluate DIVAID (open source, KIT-IBT) for PV
   clipping + EHRA/EACVI 15-segment regional parcellation -- likely replaces the planned
   vmtk PV centerline cuts AND provides the canonical regional frame for EAM/outcome.
