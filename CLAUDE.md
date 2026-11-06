@@ -172,8 +172,11 @@ seg_full and LA_seed (it used to re-extract ~700 seeds every night, ~5 min).
   rc=1, and the next night hit it again. 02 now try/excepts per case (removes the partial
   seg_full/seed file, logs `derivatives/logs/seg_failures.csv`, sleeps 30 s, continues),
   skips a case after MAX_FAILS=3 logged failures (delete its rows to retry), and waits up to
-  10 min for >= 6 GB free RAM (psutil) before starting a case. Check seg_failures.csv after
-  a night.
+  2 min for >= 2 GB free RAM (psutil), then tries anyway. Check seg_failures.csv after a
+  night. LESSON (11-04/05): the first version required 6 GB free and skipped EVERY case
+  (this PC idles at ~3 GB available but segments fine via the 26 GB pagefile), burning two
+  nights with 0 segmentations: never hard-gate on free RAM here; let try/except handle it.
+  Always check the night log for "segmenting (" / "LA mask written" counts, not just rc=0.
 - `nightly.py`: only starts when stop_time() allows it (a start in Tue-Fri daytime does
   nothing), sets env `LA_STOP_AT` (epoch of the next busy-day 07:00), runs `run_all.py` at
   BELOW_NORMAL priority (children inherit), logs to `derivatives/logs/nightly_<date>.log`,

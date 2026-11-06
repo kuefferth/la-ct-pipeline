@@ -29,8 +29,12 @@ GLOB      = "*.nii.gz"   # change to "*.nii.gz" for all cases later
 # failures a case is skipped until its row is removed from FAIL_LOG.
 FAIL_LOG  = Path("derivatives/logs/seg_failures.csv")
 MAX_FAILS = 3
-MIN_FREE_GB = 6.0        # TotalSeg highres needs several GB; wait for the PC to free RAM
-RAM_WAIT_S  = 600
+# Soft RAM guard only: this PC idles at ~3 GB "available" (Chrome/Citrix open) and still
+# segments fine via the 26 GB pagefile. A hard 6 GB gate skipped EVERY case on 11-04/05 and
+# cost two nights, so after a short wait the case is attempted anyway (try/except below
+# catches a real MemoryError).
+MIN_FREE_GB = 2.0
+RAM_WAIT_S  = 120
 
 def fail_counts():
     if not FAIL_LOG.exists():
@@ -83,8 +87,7 @@ def run():
         try:
             if not seg_out.exists():
                 if not wait_for_ram():
-                    print(f"[{case}] not enough free RAM, skipping for now")
-                    continue
+                    print(f"[{case}] low free RAM after {RAM_WAIT_S}s wait, trying anyway")
                 print(f"[{case}] segmenting (heartchambers_highres, force_split)...")
                 # force_split = z-chunks, fits 6GB VRAM on GTX 1060
                 totalsegmentator(
