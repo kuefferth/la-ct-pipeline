@@ -121,7 +121,10 @@ before. After 01 has converted them, run
 converted zips to `D:/la-ct-raw/` (same batch subfolders). Nothing else changes: 01 keeps
 skipping cases that have a NIfTI, and still finds a zip on D: if a case must be re-run.
 D: unplugged -> 01 warns "raw CT root not found" and skips cases stored there.
-Done once so far: 2026-10-20, 652 zips / 749 GB moved (log: data/logs/ct_move_log.csv).
+Done so far (log: data/logs/ct_move_log.csv): 2026-10-20, 652 zips / 749 GB; 2026-11-10,
+776 zips / 900 GB (`--max-gb 900`, 2.3 h, 0 failures) -> D: 221 GB free, F: 1084 GB free.
+D: is now nearly full: ~1.5 TB of converted zips remain on F: with no room on D:; next
+overflow needs another drive (or cold storage).
 
 Optional second lever, NOT applied (user preferred keeping all data):
 
